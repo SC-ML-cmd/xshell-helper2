@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# 测试
+.pytest_cache/
+
+# 构建和打包
+dist/
+build/
+*.egg-info/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code 本地配置
+.claude/
+
+# MCP 本地配置（含机器特定路径）
+.mcp.json
+
+# 实验/临时脚本
+test_socket*.py
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
