@@ -48,8 +48,9 @@ def clean_command_output(raw: str, cmd: str, marker: str) -> str:
                 break
 
     # 2. 确定输出起始行：跳过首行命令回显
+    # marker 不再出现在命令回显中（被 shell 空引号打断），只检查 cmd
     cmd_start = 0
-    if lines and (cmd in lines[0] and marker in lines[0]):
+    if lines and cmd in lines[0]:
         cmd_start = 1
 
     # 3. 提取输出行（命令回显之后、marker 之前）
