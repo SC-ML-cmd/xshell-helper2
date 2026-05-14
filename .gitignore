@@ -20,11 +20,8 @@ env/
 .vscode/
 .idea/
 
-# Claude Code 本地配置
-.claude/
-
-# MCP 本地配置（含机器特定路径）
-.mcp.json
+# Claude Code 本地设置（机器特定）
+.claude/settings*.local.json
 
 # 实验/临时脚本
 test_socket*.py

@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "xshell": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "xshell_mcp"],
+      "env": {
+        "XSH_XSHELL_PATH": "D:\\software\\xshell8\\Xshell.exe",
+        "XSH_DEFAULT_TIMEOUT": "60"
+      }
+    }
+  }
+}
