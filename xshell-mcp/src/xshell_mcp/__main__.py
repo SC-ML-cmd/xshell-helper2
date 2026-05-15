@@ -5,12 +5,15 @@ import sys
 
 
 def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [xshell-mcp] %(message)s",
-    )
-    logger = logging.getLogger("xshell_mcp")
+    from .config import load_config
 
+    cfg = load_config()
+
+    from .log_config import setup_logging
+
+    setup_logging(cfg.log_dir, cfg.log_level)
+
+    logger = logging.getLogger("xshell_mcp")
     logger.info("Xshell MCP Server 启动中...")
 
     from .server import init_bridge, mcp
