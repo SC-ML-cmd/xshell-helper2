@@ -284,7 +284,7 @@ def _handle_send_raw(req):
     start_row = _current_row()
 
     _log("SEND_RAW: %s [wait=%s]" % (text[:120], wait_for))
-    xsh.Screen.Send(text)
+    xsh.Screen.Send(text + "\r")
 
     timeout_ms = req.get("timeout_ms", 30000)
     timed_out = False

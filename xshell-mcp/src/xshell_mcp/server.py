@@ -82,12 +82,12 @@ def execute_command(command: str, timeout: int = 30) -> dict:
 
 @mcp.tool()
 def send_raw(text: str, wait_for: str = "$", timeout: int = 30) -> dict:
-    """向 Xshell 终端发送原始文本，不自动追加回车。
+    """向 Xshell 终端发送原始文本，自动追加回车。
 
-    用于交互式场景：输入密码、回答 yes/no 提示等。
+    用于交互式场景：输入密码、回答 yes/no 提示、菜单选择等。
 
     Args:
-        text: 要发送的文本
+        text: 要发送的文本（自动追加回车）
         wait_for: 等待终端出现的字符串（如 "$"、"#"、"password:"）
         timeout: 超时时间（秒），默认 30
     """
