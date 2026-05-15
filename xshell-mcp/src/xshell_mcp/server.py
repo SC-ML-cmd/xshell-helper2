@@ -10,8 +10,9 @@ from .bridge_client import BridgeClient
 from .xshell_launcher import launch_xshell, wait_for_bridge
 from .output_processor import clean_command_output, truncate_output
 from .exceptions import BridgeNotReadyError, BridgeTimeoutError, BridgeConnectionError
+from .log_config import get_logger, generate_request_id, set_request_id
 
-logger = logging.getLogger("xshell_mcp")
+logger = get_logger("xshell_mcp")
 
 # ============================================================
 # Server 初始化
@@ -30,6 +31,11 @@ def get_client() -> BridgeClient:
     return _client
 
 
+def _mask_if_needed(text: str) -> str:
+    """根据配置决定是否脱敏"""
+    return "***" if _config.log_mask_sensitive else text
+
+
 # ============================================================
 # 生命周期
 # ============================================================
@@ -37,11 +43,16 @@ def get_client() -> BridgeClient:
 @mcp.tool()
 def check_bridge() -> dict:
     """检查 Bridge 是否在线"""
+    rid = generate_request_id()
+    set_request_id(rid)
+
     try:
         client = get_client()
-        ok = client.check_bridge()
+        ok = client.check_bridge(request_id=rid)
+        logger.info("bridge_online=%s", ok)
         return {"bridge_online": ok}
     except Exception as e:
+        logger.info("bridge_online=False error=%s", e)
         return {"bridge_online": False, "error": str(e)}
 
 
@@ -56,13 +67,24 @@ def execute_command(command: str, timeout: int = 30) -> dict:
         command: 要执行的 shell 命令
         timeout: 超时时间（秒），默认 30
     """
+    rid = generate_request_id()
+    set_request_id(rid)
+
     client = get_client()
     marker = "{}{}".format(_config.marker_prefix, int(time.time() * 1000000))
 
+    cmd = command.strip()
+    logger.info("cmd=%.80s timeout=%d", cmd, timeout)
+
     try:
-        resp = client.execute(command.strip(), marker, timeout=timeout)
-        output = clean_command_output(resp.output, command.strip(), marker)
+        t0 = time.time()
+        resp = client.execute(cmd, marker, timeout=timeout, request_id=rid)
+        elapsed = time.time() - t0
+        output = clean_command_output(resp.output, cmd, marker)
         output, truncated = truncate_output(output)
+
+        logger.info("完成 elapsed=%.2fs output_len=%d timed_out=%s",
+                     elapsed, len(output), resp.timed_out)
 
         return {
             "output": output,
@@ -71,6 +93,7 @@ def execute_command(command: str, timeout: int = 30) -> dict:
             "command": command,
         }
     except BridgeTimeoutError:
+        logger.warning("超时 timeout=%ds", timeout)
         return {
             "output": "",
             "timed_out": True,
@@ -91,11 +114,21 @@ def send_raw(text: str, wait_for: str = "$", timeout: int = 30) -> dict:
         wait_for: 等待终端出现的字符串（如 "$"、"#"、"password:"）
         timeout: 超时时间（秒），默认 30
     """
+    rid = generate_request_id()
+    set_request_id(rid)
+
     client = get_client()
 
+    logger.info("text=%s wait_for=%s timeout=%d",
+                _mask_if_needed(text), wait_for, timeout)
+
     try:
-        resp = client.send_raw(text, wait_for, timeout=timeout)
+        t0 = time.time()
+        resp = client.send_raw(text, wait_for, timeout=timeout, request_id=rid)
+        elapsed = time.time() - t0
         output, truncated = truncate_output(resp.output)
+
+        logger.info("完成 elapsed=%.2fs output_len=%d", elapsed, len(output))
 
         return {
             "output": output,
@@ -103,6 +136,7 @@ def send_raw(text: str, wait_for: str = "$", timeout: int = 30) -> dict:
             "truncated": truncated,
         }
     except BridgeTimeoutError:
+        logger.warning("超时 timeout=%ds wait_for=%s", timeout, wait_for)
         return {
             "output": "",
             "timed_out": True,
@@ -114,9 +148,12 @@ def send_raw(text: str, wait_for: str = "$", timeout: int = 30) -> dict:
 @mcp.tool()
 def interrupt() -> dict:
     """向终端发送 Ctrl+C，中断正在运行的命令"""
-    client = get_client()
+    rid = generate_request_id()
+    set_request_id(rid)
 
-    resp = client.interrupt()
+    client = get_client()
+    resp = client.interrupt(request_id=rid)
+    logger.info("success=%s", resp.success)
     return {"success": resp.success}
 
 
@@ -127,10 +164,18 @@ def get_screen(lines: int = 50) -> dict:
     Args:
         lines: 读取的行数，默认 50
     """
+    rid = generate_request_id()
+    set_request_id(rid)
+
     client = get_client()
 
-    resp = client.get_screen(lines=lines)
+    logger.info("lines=%d", lines)
+
+    resp = client.get_screen(lines=lines, request_id=rid)
     output, truncated = truncate_output(resp.output)
+
+    logger.info("完成 output_len=%d truncated=%s screen_rows=%d screen_cols=%d",
+                len(output), truncated, resp.screen_rows, resp.screen_cols)
 
     return {
         "content": output,
@@ -143,9 +188,15 @@ def get_screen(lines: int = 50) -> dict:
 @mcp.tool()
 def get_session_info() -> dict:
     """获取当前 Xshell 终端状态信息"""
+    rid = generate_request_id()
+    set_request_id(rid)
+
     client = get_client()
 
     resp = client.get_screen(lines=1)
+    logger.info("screen_rows=%d screen_cols=%d",
+                resp.screen_rows, resp.screen_cols)
+
     return {
         "screen_rows": resp.screen_rows,
         "screen_cols": resp.screen_cols,
@@ -162,13 +213,11 @@ def init_bridge() -> BridgeClient:
     client = BridgeClient(_config.ipc_dir, timeout=_config.default_timeout)
     client.initialize()
 
-    # 检查 Bridge 是否已在运行
     if client.check_bridge():
         logger.info("Bridge 已在线")
         _client = client
         return client
 
-    # 启动 Xshell + Bridge
     logger.info("启动 Xshell 并加载 Bridge 脚本...")
     launch_xshell(_config)
 
