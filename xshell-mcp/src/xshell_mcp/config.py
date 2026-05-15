@@ -10,6 +10,9 @@ class XshellConfig:
     default_timeout: int = 30
     screen_cols: int = 200
     marker_prefix: str = "__XSH_"
+    log_dir: str = ""
+    log_level: str = "INFO"
+    log_mask_sensitive: bool = False
 
     def __post_init__(self):
         if not self.bridge_script_path:
@@ -18,6 +21,9 @@ class XshellConfig:
         if not self.ipc_dir:
             import tempfile
             self.ipc_dir = str(Path(tempfile.gettempdir()) / "xshell_mcp")
+        if not self.log_dir:
+            pkg_dir = Path(__file__).resolve().parent.parent.parent
+            self.log_dir = str(pkg_dir / "logs")
 
 
 def load_config() -> XshellConfig:
@@ -34,4 +40,10 @@ def load_config() -> XshellConfig:
         cfg.default_timeout = int(v)
     if v := os.getenv("XSH_SCREEN_COLS"):
         cfg.screen_cols = int(v)
+    if v := os.getenv("XSH_LOG_DIR"):
+        cfg.log_dir = v
+    if v := os.getenv("XSH_LOG_LEVEL"):
+        cfg.log_level = v
+    if v := os.getenv("XSH_LOG_MASK_SENSITIVE"):
+        cfg.log_mask_sensitive = v.lower() in ("1", "true", "yes")
     return cfg
