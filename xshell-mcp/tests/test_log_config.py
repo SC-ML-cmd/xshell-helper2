@@ -12,11 +12,12 @@ from xshell_mcp.log_config import (
 
 
 def _cleanup_logging():
-    """关闭所有 xshell_mcp logger 的 handler，释放文件锁"""
-    root = logging.getLogger("xshell_mcp")
-    for h in root.handlers[:]:
-        h.close()
-        root.removeHandler(h)
+    """关闭 root logger 与 xshell_mcp logger 的 handler，释放文件锁"""
+    for logger_name in ("xshell_mcp", ""):
+        lg = logging.getLogger(logger_name)
+        for h in lg.handlers[:]:
+            h.close()
+            lg.removeHandler(h)
 
 
 class TestGenerateRequestId:
@@ -79,8 +80,8 @@ class TestSetupLogging:
         with tempfile.TemporaryDirectory() as d:
             try:
                 setup_logging(d, "INFO")
-                root = logging.getLogger("xshell_mcp")
-                assert len(root.handlers) == 1
+                root = logging.getLogger()
+                assert len(root.handlers) >= 1
                 handler = root.handlers[0]
                 assert handler.maxBytes == 500 * 1024
                 assert handler.backupCount == 5

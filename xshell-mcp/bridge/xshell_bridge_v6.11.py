@@ -53,11 +53,16 @@ CFG = BridgeConfig()
 # IPC 路径
 # ============================================================
 
-IPC_DIR = os.path.join(os.environ.get("TEMP", os.path.join(os.path.expanduser("~"), "AppData", "Local", "Temp")),
-                       "xshell_mcp")
+IPC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ipc")
 REQ_FILE = os.path.join(IPC_DIR, ".request.json")
 RESP_FILE = os.path.join(IPC_DIR, ".response.json")
 LOG_FILE = os.path.join(IPC_DIR, "bridge.log")
+
+if os.environ.get("XSH_IPC_DIR"):
+    IPC_DIR = os.environ["XSH_IPC_DIR"]
+    REQ_FILE = os.path.join(IPC_DIR, ".request.json")
+    RESP_FILE = os.path.join(IPC_DIR, ".response.json")
+    LOG_FILE = os.path.join(IPC_DIR, "bridge.log")
 
 if len(sys.argv) > 1:
     IPC_DIR = sys.argv[1]

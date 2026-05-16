@@ -30,3 +30,6 @@ test_socket*.py
 .DS_Store
 Thumbs.db
 
+# 日志
+logs
+

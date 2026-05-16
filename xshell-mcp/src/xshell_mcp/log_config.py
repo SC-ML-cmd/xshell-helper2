@@ -51,12 +51,15 @@ def setup_logging(log_dir: str, level: str = "INFO") -> None:
         )
     )
 
-    root = logging.getLogger("xshell_mcp")
-    root.setLevel(getattr(logging, level.upper(), logging.INFO))
-    root.handlers.clear()
-    root.addHandler(handler)
-    root.addFilter(_RequestIdFilter())
-    root.propagate = False
+    # handler 加到 root logger，所有子 logger 都能通过 propagate 自动输出。
+    # filter 必须加在 handler 上而非 logger 上：logger 级 filter 只对从该 logger
+    # 直接发出的日志生效，子 logger propagate 上来的日志不会触发父 logger 的 filter，
+    # 导致 formatter 中的 %(request_id)s 缺失而报 KeyError。
+    root_logger = logging.getLogger()
+    root_logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+    root_logger.handlers.clear()
+    handler.addFilter(_RequestIdFilter())
+    root_logger.addHandler(handler)
 
 
 def get_logger(name: str = "xshell_mcp") -> logging.Logger:

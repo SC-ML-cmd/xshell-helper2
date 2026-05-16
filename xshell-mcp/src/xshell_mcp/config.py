@@ -19,8 +19,8 @@ class XshellConfig:
             pkg_dir = Path(__file__).resolve().parent.parent.parent
             self.bridge_script_path = str(pkg_dir / "bridge" / "xshell_bridge_v6.11.py")
         if not self.ipc_dir:
-            import tempfile
-            self.ipc_dir = str(Path(tempfile.gettempdir()) / "xshell_mcp")
+            pkg_dir = Path(__file__).resolve().parent.parent.parent
+            self.ipc_dir = str(pkg_dir / "ipc")
         if not self.log_dir:
             pkg_dir = Path(__file__).resolve().parent.parent.parent
             self.log_dir = str(pkg_dir / "logs")
