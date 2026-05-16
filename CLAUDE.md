@@ -15,6 +15,9 @@ pip install -e xshell-mcp
 # 运行 MCP Server（stdio 模式）
 python -m xshell_mcp
 
+# 运行 log_config 测试
+pytest xshell-mcp/tests/test_log_config.py -v
+
 # 运行所有测试
 pytest xshell-mcp/tests/
 
@@ -37,24 +40,27 @@ LLM (Claude) ←→ MCP Server (server.py) ←→ Bridge Client (bridge_client.p
 
 | 模块 | 职责 |
 |------|------|
-| `server.py` | FastMCP 服务器，定义 6 个工具函数作为外部 API |
-| `bridge_client.py` | 通过 `.request.json` / `.response.json` 文件与 Bridge 进行 IPC 通信 |
+| `server.py` | FastMCP 服务器，定义 6 个工具函数作为外部 API，每个调用生成 `request_id` 并记录入口/出口日志 |
+| `bridge_client.py` | 通过 `.request.json` / `.response.json` 文件与 Bridge 进行 IPC 通信，接收 `request_id` 传入 `_send_request` 做链路追踪 |
 | `bridge/xshell_bridge_v6.11.py` | 在 Xshell 内部运行，使用 `xsh.Screen.Send()` 执行命令并轮询 marker 检测输出完成 |
 | `protocol.py` | IPC 的 `Request` / `Response` 数据类 |
 | `output_processor.py` | 清理 ANSI 转义序列、命令回显、marker 行和提示符，从原始终端输出中提取命令结果 |
 | `xshell_launcher.py` | 通过 `Xshell.exe -script <bridge>` 启动 Xshell |
-| `config.py` | 基于环境变量的配置（`XSH_XSHELL_PATH`、`XSH_DEFAULT_TIMEOUT` 等） |
+| `config.py` | 基于环境变量的配置（路径、超时、日志等） |
+| `log_config.py` | 文件日志配置：`RotatingFileHandler`（500KB/5 文件）、`contextvars` 注入 `request_id`、日志脱敏 |
 
 ### 数据流（命令执行）
 
 1. LLM 调用 MCP 工具 `execute_command("ls -la")`
-2. `server.py` 创建带唯一 marker 的 `Request`
-3. `bridge_client.py` 将请求写入 `%TEMP%\xshell_mcp\.request.json`
-4. Bridge 脚本每 200ms 轮询该文件，检测到变化后读取请求
-5. Bridge 检测 shell 类型（CMD → `&`，Bash/PowerShell → `;`），发送 `cmd ; echo MARKER`
-6. Bridge 轮询终端直到出现 marker，读取屏幕行作为原始输出
-7. Bridge 将 `Response` 写入 `.response.json`
-8. `bridge_client.py` 读取响应，`output_processor.py` 清理输出并返回
+2. `server.py` 生成 `request_id`（格式 `ttttt-nnnnn`），注入 `contextvars`，记录入口日志（cmd、timeout）
+3. `server.py` 将 `request_id` 传入 `bridge_client.execute()`，创建带唯一 marker 的 `Request`
+4. `bridge_client.py` 将请求写入 `%TEMP%\xshell_mcp\.request.json`，记录 IPC 请求日志
+5. Bridge 脚本每 200ms 轮询该文件，检测到变化后读取请求
+6. Bridge 检测 shell 类型（CMD → `&`，Bash/PowerShell → `;`），发送 `cmd ; echo MARKER`
+7. Bridge 轮询终端直到出现 marker，读取屏幕行作为原始输出
+8. Bridge 将 `Response` 写入 `.response.json`
+9. `bridge_client.py` 读取响应，记录 IPC 响应日志（success、output_len、elapsed）
+10. `server.py` 的 `output_processor.py` 清理输出，记录出口日志（elapsed、output_len、timed_out）
 
 ### IPC 协议
 
@@ -63,6 +69,15 @@ LLM (Claude) ←→ MCP Server (server.py) ←→ Bridge Client (bridge_client.p
 - Bridge 客户端在写入新请求前删除旧响应文件，使用 `.tmp` + 原子 rename 保证写入完整性
 - 轮询间隔：Bridge 端 200ms，客户端端 100ms
 
+### 日志系统
+
+- 日志文件：`logs/xshell_mcp.log`（通过 `XSH_LOG_DIR` 可配置）
+- 格式：`时间(ms) 级别 [request_id] 文件:行号 函数名() | 消息`
+- `request_id` 通过 `contextvars` 注入，自动串联 server → bridge_client 的同一调用链路
+- `RotatingFileHandler`：单文件 500KB，保留 5 个历史文件
+- 输出内容只记录长度（`output_len`），不记录原文
+- `send_raw` 的 `text` 参数可通过 `XSH_LOG_MASK_SENSITIVE=true` 脱敏
+
 ### 配置（环境变量）
 
 - `XSH_XSHELL_PATH` — Xshell.exe 路径
@@ -70,6 +85,9 @@ LLM (Claude) ←→ MCP Server (server.py) ←→ Bridge Client (bridge_client.p
 - `XSH_IPC_DIR` — IPC 目录（默认为 `%TEMP%\xshell_mcp`）
 - `XSH_DEFAULT_TIMEOUT` — 命令超时秒数（默认 30）
 - `XSH_SCREEN_COLS` — 屏幕列宽（默认 200）
+- `XSH_LOG_DIR` — 日志目录（默认为项目根 `logs/`）
+- `XSH_LOG_LEVEL` — 日志级别（默认 `INFO`，可选 `DEBUG`/`WARNING`/`ERROR`）
+- `XSH_LOG_MASK_SENSITIVE` — 是否脱敏 `send_raw` 内容（默认 `false`，设为 `true` 时 `text` 参数显示为 `***`）
 
 <!-- superpowers-zh:begin (do not edit between these markers) -->
 # Superpowers-ZH 中文增强版
