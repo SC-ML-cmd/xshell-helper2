@@ -263,6 +263,20 @@ def list_sessions() -> dict:
     set_request_id(rid)
 
     if _session_manager is None:
+        if _bound_session_id == "legacy":
+            return {
+                "sessions": [{
+                    "session_id": "legacy",
+                    "remote_address": "",
+                    "remote_port": 0,
+                    "session_name": "legacy (XSH_IPC_DIR)",
+                    "tab_text": "",
+                    "user_name": "",
+                    "status": "已绑定 (legacy 单会话模式)",
+                }],
+                "count": 1,
+                "mode": "legacy"
+            }
         return {"error": "Session Manager 未初始化", "sessions": []}
 
     _session_manager.check_stale_bindings()
@@ -303,6 +317,13 @@ def connect_session(session_id: str = "") -> dict:
     set_request_id(rid)
 
     if _session_manager is None:
+        if _bound_session_id == "legacy":
+            return {
+                "success": True,
+                "session_id": "legacy",
+                "message": "Legacy 单会话模式已自动绑定，无需手动连接",
+                "mode": "legacy"
+            }
         return {"success": False, "error": "Session Manager 未初始化"}
 
     # 如果已绑定，先断开
@@ -409,6 +430,14 @@ def get_bridge_info() -> dict:
     info = {}
     if _session_manager:
         info = _session_manager.get_session_info(_bound_session_id) or {}
+    elif _bound_session_id == "legacy":
+        info = {
+            "session_id": "legacy",
+            "remote_address": "",
+            "session_name": "legacy (XSH_IPC_DIR)",
+            "ipc_dir": _config.ipc_dir,
+            "mode": "legacy",
+        }
 
     return {
         "bound": True,
@@ -429,8 +458,30 @@ def get_bridge_info() -> dict:
 
 def _init_session_manager():
     """初始化 Session Manager，发现已注册的 bridge"""
-    global _session_manager
+    global _session_manager, _bound_session_id, _bound_client
 
+    # Legacy 模式：XSH_IPC_DIR 已设置且 XSH_IPC_BASE 未设置
+    # 退回旧的单会话模式，直接连接到指定 IPC 目录
+    if os.getenv("XSH_IPC_DIR") and not os.getenv("XSH_IPC_BASE"):
+        logger.info("检测到 legacy 模式 (XSH_IPC_DIR=%s)，使用单会话直连", _config.ipc_dir)
+        client = BridgeClient(_config.ipc_dir, timeout=_config.default_timeout)
+        client.initialize()
+        _bound_client = client
+        _bound_session_id = "legacy"
+        set_session_id("legacy")
+        _session_manager = None  # 不使用 SessionManager
+
+        # 尝试检查 bridge 是否在线
+        try:
+            if client.check_bridge():
+                logger.info("Legacy 模式: Bridge 已在线")
+            else:
+                logger.warning("Legacy 模式: Bridge 未在线，命令执行需要 Bridge 先启动")
+        except Exception:
+            logger.warning("Legacy 模式: Bridge 检测失败，命令执行需要 Bridge 先启动")
+        return
+
+    # 正常多会话路径
     _session_manager = SessionManager(_config.ipc_base, timeout=_config.default_timeout)
 
     sessions = _session_manager.discover()
