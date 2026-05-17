@@ -1,5 +1,7 @@
 """Xshell MCP Server — 让大模型通过 Xshell 执行命令"""
 
+import atexit
+import os
 import time
 import logging
 
@@ -7,10 +9,17 @@ from mcp.server.fastmcp import FastMCP
 
 from .config import load_config
 from .bridge_client import BridgeClient
-from .xshell_launcher import launch_xshell, wait_for_bridge
+from .session_manager import SessionManager
 from .output_processor import clean_command_output, truncate_output
-from .exceptions import BridgeNotReadyError, BridgeTimeoutError, BridgeConnectionError
-from .log_config import get_logger, generate_request_id, set_request_id
+from .exceptions import (
+    BridgeNotReadyError,
+    BridgeTimeoutError,
+    BridgeConnectionError,
+    SessionNotBoundError,
+    SessionNotFoundError,
+    SessionOccupiedError,
+)
+from .log_config import get_logger, generate_request_id, set_request_id, set_session_id
 
 logger = get_logger("xshell_mcp")
 
@@ -21,14 +30,19 @@ logger = get_logger("xshell_mcp")
 mcp = FastMCP("xshell-mcp")
 
 _config = load_config()
-_client: BridgeClient | None = None
+_bound_session_id: str | None = None
+_bound_client: BridgeClient | None = None
+_session_manager: SessionManager | None = None
 
 
 def get_client() -> BridgeClient:
-    global _client
-    if _client is None:
-        raise BridgeNotReadyError("Bridge 未初始化，请先启动 MCP Server")
-    return _client
+    global _bound_client
+    if _bound_client is None:
+        raise SessionNotBoundError(
+            "尚未绑定 XShell 会话，请先调用 list_sessions() 查看可用会话，"
+            "再调用 connect_session(session_id) 绑定"
+        )
+    return _bound_client
 
 
 def _mask_if_needed(text: str) -> str:
@@ -67,6 +81,8 @@ def execute_command(command: str, timeout: int = 30) -> dict:
         command: 要执行的 shell 命令
         timeout: 超时时间（秒），默认 30
     """
+    global _bound_session_id, _bound_client
+
     rid = generate_request_id()
     set_request_id(rid)
 
@@ -93,6 +109,18 @@ def execute_command(command: str, timeout: int = 30) -> dict:
             "command": command,
         }
     except BridgeTimeoutError:
+        # 二次检查 bridge 是否还活着
+        if _bound_session_id and _session_manager:
+            if not _session_manager._is_bridge_alive(_bound_session_id):
+                _bound_session_id = None
+                _bound_client = None
+                set_session_id("")
+                return {
+                    "output": "",
+                    "error": "XShell 会话已断开（tab 可能已关闭），请调用 list_sessions() 重新选择",
+                    "timed_out": True,
+                    "session_lost": True,
+                }
         logger.warning("超时 timeout=%ds", timeout)
         return {
             "output": "",
@@ -114,6 +142,8 @@ def send_raw(text: str, wait_for: str = "$", timeout: int = 30) -> dict:
         wait_for: 等待终端出现的字符串（如 "$"、"#"、"password:"）
         timeout: 超时时间（秒），默认 30
     """
+    global _bound_session_id, _bound_client
+
     rid = generate_request_id()
     set_request_id(rid)
 
@@ -136,6 +166,18 @@ def send_raw(text: str, wait_for: str = "$", timeout: int = 30) -> dict:
             "truncated": truncated,
         }
     except BridgeTimeoutError:
+        # 二次检查 bridge 是否还活着
+        if _bound_session_id and _session_manager:
+            if not _session_manager._is_bridge_alive(_bound_session_id):
+                _bound_session_id = None
+                _bound_client = None
+                set_session_id("")
+                return {
+                    "output": "",
+                    "error": "XShell 会话已断开（tab 可能已关闭），请调用 list_sessions() 重新选择",
+                    "timed_out": True,
+                    "session_lost": True,
+                }
         logger.warning("超时 timeout=%ds wait_for=%s", timeout, wait_for)
         return {
             "output": "",
@@ -204,32 +246,220 @@ def get_session_info() -> dict:
 
 
 # ============================================================
+# 会话管理工具
+# ============================================================
+
+@mcp.tool()
+def list_sessions() -> dict:
+    """列出所有 XShell 会话（含 PID、远程地址、占用状态）。
+
+    返回所有已注册且存活的 XShell Bridge 会话列表，每个会话包含：
+    - session_id: 会话标识
+    - remote_address: 远程主机地址
+    - session_name: 会话名称
+    - status: 占用状态（空闲/已占用）
+    """
+    rid = generate_request_id()
+    set_request_id(rid)
+
+    if _session_manager is None:
+        return {"error": "Session Manager 未初始化", "sessions": []}
+
+    _session_manager.check_stale_bindings()
+    sessions = _session_manager.discover()
+
+    # 简化输出
+    result = []
+    for s in sessions:
+        result.append({
+            "session_id": s.get("session_id", ""),
+            "remote_address": s.get("remote_address", ""),
+            "remote_port": s.get("remote_port", 0),
+            "session_name": s.get("session_name", ""),
+            "tab_text": s.get("tab_text", ""),
+            "user_name": s.get("user_name", ""),
+            "status": s.get("status", "未知"),
+        })
+
+    logger.info("list_sessions: 发现 %d 个会话", len(result))
+    return {"sessions": result, "count": len(result)}
+
+
+@mcp.tool()
+def connect_session(session_id: str = "") -> dict:
+    """绑定一个 XShell 会话（CAS 并发安全）。
+
+    绑定后，该窗口的所有命令（execute_command、send_raw 等）自动路由到此 session。
+
+    - session_id 为空时：如果只有 1 个空闲会话则自动绑定，多个则列出供选择
+    - session_id 非空时：绑定指定的会话
+
+    Args:
+        session_id: 要绑定的会话 ID（如 "session_92292"），为空则自动选择
+    """
+    global _bound_session_id, _bound_client
+
+    rid = generate_request_id()
+    set_request_id(rid)
+
+    if _session_manager is None:
+        return {"success": False, "error": "Session Manager 未初始化"}
+
+    # 如果已绑定，先断开
+    if _bound_session_id:
+        logger.info("已有绑定 session=%s，先断开", _bound_session_id)
+        _session_manager.unbind(_bound_session_id)
+        _bound_session_id = None
+        _bound_client = None
+        set_session_id("")
+
+    mcp_pid = os.getpid()
+
+    # 自动选择逻辑
+    if not session_id:
+        _session_manager.check_stale_bindings()
+        available = _session_manager.list_available()
+        if len(available) == 0:
+            return {
+                "success": False,
+                "error": "没有可用的空闲会话，请在 XShell 中运行 bridge 脚本"
+            }
+        elif len(available) == 1:
+            session_id = available[0]["session_id"]
+            logger.info("自动选择唯一空闲会话: %s", session_id)
+        else:
+            # 多个空闲会话，返回列表让用户选择
+            sessions = []
+            for s in available:
+                sessions.append({
+                    "session_id": s.get("session_id", ""),
+                    "remote_address": s.get("remote_address", ""),
+                    "session_name": s.get("session_name", ""),
+                    "tab_text": s.get("tab_text", ""),
+                })
+            return {
+                "success": False,
+                "error": "有多个空闲会话，请指定 session_id",
+                "available_sessions": sessions
+            }
+
+    try:
+        client = _session_manager.bind(session_id, mcp_pid)
+        _bound_session_id = session_id
+        _bound_client = client
+        set_session_id(session_id)
+
+        # 注册 atexit 清理
+        info = _session_manager.get_session_info(session_id) or {}
+
+        logger.info("绑定成功 session=%s remote=%s", session_id,
+                    info.get("remote_address", ""))
+        return {
+            "success": True,
+            "session_id": session_id,
+            "remote_address": info.get("remote_address", ""),
+            "remote_port": info.get("remote_port", 0),
+            "session_name": info.get("session_name", ""),
+            "tab_text": info.get("tab_text", ""),
+            "user_name": info.get("user_name", ""),
+        }
+    except (SessionNotFoundError, SessionOccupiedError) as e:
+        logger.warning("绑定失败: %s", e)
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+def disconnect_session() -> dict:
+    """断开当前绑定的 XShell 会话，释放占用标记。
+
+    断开后需要重新调用 connect_session() 绑定才能执行命令。
+    """
+    global _bound_session_id, _bound_client
+
+    rid = generate_request_id()
+    set_request_id(rid)
+
+    if not _bound_session_id:
+        return {"success": True, "message": "当前没有绑定的会话"}
+
+    old_session = _bound_session_id
+    if _session_manager:
+        _session_manager.unbind(_bound_session_id)
+
+    _bound_session_id = None
+    _bound_client = None
+    set_session_id("")
+
+    logger.info("已断开 session=%s", old_session)
+    return {"success": True, "session_id": old_session}
+
+
+@mcp.tool()
+def get_bridge_info() -> dict:
+    """返回当前绑定的 XShell 会话信息。
+
+    包括 session_id、bridge PID、远程地址等，用于确认当前 Claude Code 窗口对应哪个 XShell 页签。
+    """
+    rid = generate_request_id()
+    set_request_id(rid)
+
+    if not _bound_session_id:
+        return {"bound": False, "message": "当前没有绑定的会话"}
+
+    info = {}
+    if _session_manager:
+        info = _session_manager.get_session_info(_bound_session_id) or {}
+
+    return {
+        "bound": True,
+        "session_id": _bound_session_id,
+        "bridge_pid": info.get("pid", 0),
+        "remote_address": info.get("remote_address", ""),
+        "remote_port": info.get("remote_port", 0),
+        "session_name": info.get("session_name", ""),
+        "tab_text": info.get("tab_text", ""),
+        "user_name": info.get("user_name", ""),
+        "connected": info.get("connected", False),
+    }
+
+
+# ============================================================
 # 启动逻辑
 # ============================================================
 
-def init_bridge() -> BridgeClient:
-    global _client
+def _init_session_manager():
+    """初始化 Session Manager，发现已注册的 bridge"""
+    global _session_manager
 
-    client = BridgeClient(_config.ipc_dir, timeout=_config.default_timeout)
-    client.initialize()
+    _session_manager = SessionManager(_config.ipc_base, timeout=_config.default_timeout)
 
-    if client.check_bridge():
-        logger.info("Bridge 已在线")
-        _client = client
-        return client
+    sessions = _session_manager.discover()
+    if sessions:
+        logger.info("发现 %d 个已注册的 bridge", len(sessions))
+        for s in sessions:
+            logger.info("  - %s (%s:%s) [%s]",
+                       s.get("session_id", ""),
+                       s.get("remote_address", ""),
+                       s.get("remote_port", ""),
+                       s.get("status", ""))
+    else:
+        logger.info("未发现已注册的 bridge，请在 XShell 中运行 xshell_bridge_v7.py 脚本")
 
-    logger.info("启动 Xshell 并加载 Bridge 脚本...")
-    launch_xshell(_config)
 
-    logger.info("等待 Bridge 就绪...")
-    if not wait_for_bridge(client):
-        raise BridgeNotReadyError(
-            "Bridge 启动超时。请确认:\n"
-            "1. Xshell 已安装且路径正确\n"
-            "2. Xshell 的脚本功能可用\n"
-            "3. 手动打开 Xshell → 工具 → 脚本 → 运行 → 选择 bridge/xshell_bridge.py"
-        )
+# ============================================================
+# atexit 清理
+# ============================================================
 
-    logger.info("Bridge 就绪")
-    _client = client
-    return client
+def _cleanup_on_exit():
+    """MCP Server 退出时自动清除占用标记"""
+    global _bound_session_id, _bound_client
+    if _bound_session_id and _session_manager:
+        try:
+            _session_manager.unbind(_bound_session_id)
+            logger.info("atexit: 已清除占用标记 session=%s", _bound_session_id)
+        except Exception:
+            pass
+    _bound_session_id = None
+    _bound_client = None
+
+atexit.register(_cleanup_on_exit)
