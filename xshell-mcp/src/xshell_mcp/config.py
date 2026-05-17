@@ -7,6 +7,7 @@ class XshellConfig:
     xshell_path: str = r"D:\software\xshell8\Xshell.exe"
     bridge_script_path: str = ""
     ipc_dir: str = ""
+    ipc_base: str = ""    # 多会话 IPC 根目录（注册和 sessions 的父目录）
     default_timeout: int = 30
     screen_cols: int = 200
     marker_prefix: str = "__XSH_"
@@ -21,6 +22,9 @@ class XshellConfig:
         if not self.ipc_dir:
             pkg_dir = Path(__file__).resolve().parent.parent.parent
             self.ipc_dir = str(pkg_dir / "ipc")
+        if not self.ipc_base:
+            pkg_dir = Path(__file__).resolve().parent.parent.parent
+            self.ipc_base = str(pkg_dir / "ipc")
         if not self.log_dir:
             pkg_dir = Path(__file__).resolve().parent.parent.parent
             self.log_dir = str(pkg_dir / "logs")
@@ -36,6 +40,8 @@ def load_config() -> XshellConfig:
         cfg.bridge_script_path = v
     if v := os.getenv("XSH_IPC_DIR"):
         cfg.ipc_dir = v
+    if v := os.getenv("XSH_IPC_BASE"):
+        cfg.ipc_base = v
     if v := os.getenv("XSH_DEFAULT_TIMEOUT"):
         cfg.default_timeout = int(v)
     if v := os.getenv("XSH_SCREEN_COLS"):

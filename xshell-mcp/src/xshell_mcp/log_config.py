@@ -9,6 +9,9 @@ from pathlib import Path
 _request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
     "request_id", default=""
 )
+_session_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "session_id", default=""
+)
 _counter = 0
 _lock = threading.Lock()
 
@@ -26,9 +29,20 @@ def set_request_id(rid: str) -> None:
     _request_id_var.set(rid)
 
 
+def set_session_id(sid: str) -> None:
+    """设置当前上下文的 session_id"""
+    _session_id_var.set(sid)
+
+
+def get_session_id() -> str:
+    """获取当前上下文的 session_id"""
+    return _session_id_var.get()
+
+
 class _RequestIdFilter(logging.Filter):
     def filter(self, record):
         record.request_id = _request_id_var.get()
+        record.session_id = _session_id_var.get()
         return True
 
 
@@ -45,7 +59,7 @@ def setup_logging(log_dir: str, level: str = "INFO") -> None:
     )
     handler.setFormatter(
         logging.Formatter(
-            "%(asctime)s.%(msecs)03d %(levelname)-5s [%(request_id)s] "
+            "%(asctime)s.%(msecs)03d %(levelname)-5s [%(session_id)s] [%(request_id)s] "
             "%(filename)s:%(lineno)d %(funcName)s() | %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )

@@ -21,3 +21,18 @@ class BridgeConnectionError(XshellMCPError):
 class NoActiveSessionError(XshellMCPError):
     """Xshell 中没有活跃的终端会话"""
     pass
+
+
+class SessionNotFoundError(XshellMCPError):
+    """指定的 XShell 会话不存在"""
+    pass
+
+
+class SessionOccupiedError(XshellMCPError):
+    """指定的 XShell 会话已被其他窗口占用"""
+    pass
+
+
+class SessionNotBoundError(XshellMCPError):
+    """当前 MCP Server 尚未绑定 XShell 会话"""
+    pass
