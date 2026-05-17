@@ -22,9 +22,9 @@ def main():
         _init_session_manager()
     except Exception as e:
         logger.warning("Session Manager 初始化失败: %s", e)
-        logger.warning("将继续启动 MCP Server，请确认 ipc_base 路径配置正确")
+        logger.warning("将继续启动 MCP Server，请在 XShell 中运行 xshell_bridge_v7.py 脚本")
 
-    logger.info("MCP Server 就绪")
+    logger.info("MCP Server 就绪，等待通过 connect_session() 绑定 XShell 会话")
     mcp.run(transport="stdio")
 
 

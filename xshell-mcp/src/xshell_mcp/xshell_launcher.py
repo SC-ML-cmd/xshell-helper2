@@ -54,3 +54,16 @@ def wait_for_bridge(client: BridgeClient, timeout: int = 20) -> bool:
             return True
         time.sleep(0.5)
     return False
+
+
+def get_bridge_guidance() -> str:
+    """返回引导用户手动运行 bridge 脚本的提示文本"""
+    return (
+        "请在 XShell 中手动运行 Bridge 脚本：\n"
+        "1. 打开 XShell，连接到目标主机\n"
+        "2. 菜单 → 工具 → 脚本 → 运行\n"
+        "3. 选择 xshell_bridge_v7.py 脚本\n"
+        "4. 每个需要使用的 XShell 页签都需要运行一次\n"
+        "5. 运行后，在 Claude Code 中调用 list_sessions() 查看可用会话\n"
+        "6. 调用 connect_session() 绑定一个会话"
+    )
