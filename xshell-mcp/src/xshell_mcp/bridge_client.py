@@ -2,6 +2,7 @@
 
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -18,6 +19,7 @@ class BridgeClient:
         self._req_file = self._ipc_dir / ".request.json"
         self._resp_file = self._ipc_dir / ".response.json"
         self._default_timeout = timeout
+        self._lock = threading.Lock()
 
     def initialize(self):
         self._ipc_dir.mkdir(parents=True, exist_ok=True)
@@ -74,34 +76,35 @@ class BridgeClient:
         return self._send_request(req, timeout=timeout, request_id=request_id)
 
     def _send_request(self, req: Request, timeout: int, request_id: str = "") -> Response:
-        if timeout <= 0:
-            timeout = self._default_timeout
-        set_request_id(request_id)
+        with self._lock:
+            if timeout <= 0:
+                timeout = self._default_timeout
+            set_request_id(request_id)
 
-        self._ipc_dir.mkdir(parents=True, exist_ok=True)
-        _remove_if_exists(self._resp_file)
+            self._ipc_dir.mkdir(parents=True, exist_ok=True)
+            _remove_if_exists(self._resp_file)
 
-        logger.info("写入请求 type=%s cmd=%.80s", req.type, req.cmd[:80])
+            logger.info("写入请求 type=%s cmd=%.80s", req.type, req.cmd[:80])
 
-        _write_json(self._req_file, req)
+            _write_json(self._req_file, req)
 
-        t0 = time.time()
-        deadline = time.time() + timeout + 2
-        while time.time() < deadline:
-            resp_data = _read_json(self._resp_file)
-            if resp_data is not None:
-                elapsed = time.time() - t0
-                resp = Response(**{k: v for k, v in resp_data.items() if k in Response._FIELDS})
-                logger.info("收到响应 success=%s output_len=%d elapsed=%.2fs",
-                            resp.success, len(resp.output), elapsed)
-                return resp
-            time.sleep(0.1)
+            t0 = time.time()
+            deadline = time.time() + timeout + 2
+            while time.time() < deadline:
+                resp_data = _read_json(self._resp_file)
+                if resp_data is not None:
+                    elapsed = time.time() - t0
+                    resp = Response(**{k: v for k, v in resp_data.items() if k in Response._FIELDS})
+                    logger.info("收到响应 success=%s output_len=%d elapsed=%.2fs",
+                                resp.success, len(resp.output), elapsed)
+                    return resp
+                time.sleep(0.1)
 
-        elapsed = time.time() - t0
-        logger.warning("请求超时 type=%s timeout=%ds elapsed=%.2fs", req.type, timeout, elapsed)
-        raise BridgeTimeoutError(
-            "Bridge 命令执行超时 ({}s): {}".format(timeout, req.cmd[:80])
-        )
+            elapsed = time.time() - t0
+            logger.warning("请求超时 type=%s timeout=%ds elapsed=%.2fs", req.type, timeout, elapsed)
+            raise BridgeTimeoutError(
+                "Bridge 命令执行超时 ({}s): {}".format(timeout, req.cmd[:80])
+            )
 
 
 def _write_json(path, obj):
