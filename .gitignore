@@ -33,3 +33,7 @@ Thumbs.db
 # 日志
 logs
 
+# IPC runtime directories
+ipc/
+**/ipc/
+

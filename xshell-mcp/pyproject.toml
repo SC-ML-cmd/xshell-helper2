@@ -1,6 +1,6 @@
 [project]
 name = "xshell-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server that lets LLMs execute commands in Xshell terminal sessions"
 requires-python = ">=3.10"
 dependencies = [

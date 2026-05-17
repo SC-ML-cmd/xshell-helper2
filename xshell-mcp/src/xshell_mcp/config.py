@@ -18,7 +18,7 @@ class XshellConfig:
     def __post_init__(self):
         if not self.bridge_script_path:
             pkg_dir = Path(__file__).resolve().parent.parent.parent
-            self.bridge_script_path = str(pkg_dir / "bridge" / "xshell_bridge_v6.11.py")
+            self.bridge_script_path = str(pkg_dir / "bridge" / "xshell_bridge_v7.py")
         if not self.ipc_dir:
             pkg_dir = Path(__file__).resolve().parent.parent.parent
             self.ipc_dir = str(pkg_dir / "ipc")
