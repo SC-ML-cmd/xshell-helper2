@@ -3,6 +3,7 @@
 import atexit
 import os
 import time
+import threading
 import logging
 
 from mcp.server.fastmcp import FastMCP
@@ -305,7 +306,7 @@ def connect_session(session_id: str = "") -> dict:
 
     绑定后，该窗口的所有命令（execute_command、send_raw 等）自动路由到此 session。
 
-    - session_id 为空时：如果只有 1 个空闲会话则自动绑定，多个则列出供选择
+    - session_id 为空时：自动选择 started_at 最早的会话（多个时逐个尝试，处理并发抢占）
     - session_id 非空时：绑定指定的会话
 
     Args:
@@ -345,32 +346,54 @@ def connect_session(session_id: str = "") -> dict:
                 "success": False,
                 "error": "没有可用的空闲会话，请在 XShell 中运行 bridge 脚本"
             }
-        elif len(available) == 1:
-            session_id = available[0]["session_id"]
-            logger.info("自动选择唯一空闲会话: %s", session_id)
-        else:
-            # 多个空闲会话，返回列表让用户选择
-            sessions = []
-            for s in available:
-                sessions.append({
-                    "session_id": s.get("session_id", ""),
-                    "remote_address": s.get("remote_address", ""),
-                    "session_name": s.get("session_name", ""),
-                    "tab_text": s.get("tab_text", ""),
-                })
-            return {
-                "success": False,
-                "error": "有多个空闲会话，请指定 session_id",
-                "available_sessions": sessions
-            }
 
+        # 按 started_at 升序排列（最早启动的优先），缺失字段排最后
+        available.sort(key=lambda s: s.get("started_at", "9999"))
+
+        logger.info("自动选择: %d 个空闲会话，按 started_at 排序", len(available))
+        for s in available:
+            logger.info("  - %s started_at=%s", s.get("session_id", ""), s.get("started_at", "?"))
+
+        # 逐个尝试绑定，处理并发抢占
+        for s in available:
+            sid = s["session_id"]
+            try:
+                client = _session_manager.bind(sid, mcp_pid)
+                _bound_session_id = sid
+                _bound_client = client
+                set_session_id(sid)
+
+                info = _session_manager.get_session_info(sid) or {}
+                logger.info("自动绑定成功 session=%s remote=%s", sid,
+                           info.get("remote_address", ""))
+                return {
+                    "success": True,
+                    "session_id": sid,
+                    "remote_address": info.get("remote_address", ""),
+                    "remote_port": info.get("remote_port", 0),
+                    "session_name": info.get("session_name", ""),
+                    "tab_text": info.get("tab_text", ""),
+                    "user_name": info.get("user_name", ""),
+                }
+            except SessionOccupiedError:
+                logger.warning("会话 %s 已被抢占，尝试下一个...", sid)
+                continue
+            except SessionNotFoundError:
+                logger.warning("会话 %s 已消失，尝试下一个...", sid)
+                continue
+
+        return {
+            "success": False,
+            "error": "所有空闲会话绑定失败（可能被抢占），请重试"
+        }
+
+    # session_id 非空：绑定指定会话
     try:
         client = _session_manager.bind(session_id, mcp_pid)
         _bound_session_id = session_id
         _bound_client = client
         set_session_id(session_id)
 
-        # 注册 atexit 清理
         info = _session_manager.get_session_info(session_id) or {}
 
         logger.info("绑定成功 session=%s remote=%s", session_id,
@@ -460,6 +483,10 @@ def _init_session_manager():
     """初始化 Session Manager，发现已注册的 bridge"""
     global _session_manager, _bound_session_id, _bound_client
 
+    logger.debug("XSH_IPC_DIR=%r XSH_IPC_BASE=%r ipc_base=%r ipc_dir=%r",
+                 os.getenv("XSH_IPC_DIR"), os.getenv("XSH_IPC_BASE"),
+                 _config.ipc_base, _config.ipc_dir)
+
     # Legacy 模式：XSH_IPC_DIR 已设置且 XSH_IPC_BASE 未设置
     # 退回旧的单会话模式，直接连接到指定 IPC 目录
     if os.getenv("XSH_IPC_DIR") and not os.getenv("XSH_IPC_BASE"):
@@ -494,7 +521,74 @@ def _init_session_manager():
                        s.get("remote_port", ""),
                        s.get("status", ""))
     else:
-        logger.info("未发现已注册的 bridge，请在 XShell 中运行 xshell_bridge_v7.py 脚本")
+        logger.info("未发现已注册的 bridge，将在后台轮询等待...")
+
+
+def _auto_bind_loop():
+    """后台线程：轮询等待空闲会话并自动绑定"""
+    global _bound_session_id, _bound_client
+
+    deadline = time.time() + _config.auto_bind_timeout
+    mcp_pid = os.getpid()
+
+    while time.time() < deadline:
+        _session_manager.check_stale_bindings()
+        available = _session_manager.list_available()
+
+        if not available:
+            logger.info("自动绑定: 未发现空闲会话，%ds 后重试... (剩余 %ds)",
+                       _config.auto_bind_poll_interval,
+                       int(deadline - time.time()))
+            time.sleep(_config.auto_bind_poll_interval)
+            continue
+
+        # 按 started_at 升序排列（最早启动的优先），缺失字段排最后
+        available.sort(key=lambda s: s.get("started_at", "9999"))
+
+        logger.info("自动绑定: 发现 %d 个空闲会话，按启动时间排序后尝试绑定", len(available))
+        for s in available:
+            logger.info("  - %s started_at=%s remote=%s",
+                       s.get("session_id", ""),
+                       s.get("started_at", "?"),
+                       s.get("remote_address", ""))
+
+        # 逐个尝试 CAS 绑定，被抢占则 fallback 到下一个
+        for s in available:
+            sid = s["session_id"]
+            try:
+                client = _session_manager.bind(sid, mcp_pid)
+                _bound_session_id = sid
+                _bound_client = client
+                set_session_id(sid)
+                logger.info("自动绑定成功: %s (started_at=%s)",
+                           sid, s.get("started_at", ""))
+                return
+            except SessionOccupiedError:
+                logger.warning("自动绑定: 会话 %s 已被抢占，尝试下一个...", sid)
+                continue
+            except SessionNotFoundError:
+                logger.warning("自动绑定: 会话 %s 已消失，尝试下一个...", sid)
+                continue
+
+        # 所有会话绑定失败，等待后下一轮重新扫描
+        logger.info("自动绑定: 所有空闲会话绑定失败（可能被抢占），%ds 后重试...",
+                   _config.auto_bind_poll_interval)
+        time.sleep(_config.auto_bind_poll_interval)
+
+    logger.warning("自动绑定超时（%ds），MCP Server 将以未绑定状态运行，"
+                  "请稍后调用 list_sessions() 和 connect_session() 手动绑定",
+                  _config.auto_bind_timeout)
+
+
+def start_auto_bind():
+    """启动后台自动绑定线程（非阻塞）"""
+    if _session_manager is None:
+        return  # legacy 模式无需后台绑定
+
+    t = threading.Thread(target=_auto_bind_loop, daemon=True, name="auto-bind")
+    t.start()
+    logger.info("后台自动绑定线程已启动（timeout=%ds interval=%ds）",
+               _config.auto_bind_timeout, _config.auto_bind_poll_interval)
 
 
 # ============================================================

@@ -59,7 +59,7 @@ def setup_logging(log_dir: str, level: str = "INFO") -> None:
     )
     handler.setFormatter(
         logging.Formatter(
-            "%(asctime)s.%(msecs)03d %(levelname)-5s [%(session_id)s] [%(request_id)s] "
+            "%(asctime)s.%(msecs)03d PID:%(process)d %(levelname)-5s [%(session_id)s] [%(request_id)s] "
             "%(filename)s:%(lineno)d %(funcName)s() | %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )

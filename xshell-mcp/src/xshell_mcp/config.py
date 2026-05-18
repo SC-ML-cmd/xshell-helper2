@@ -9,6 +9,8 @@ class XshellConfig:
     ipc_dir: str = ""
     ipc_base: str = ""    # 多会话 IPC 根目录（注册和 sessions 的父目录）
     default_timeout: int = 30
+    auto_bind_timeout: int = 120       # 启动时自动绑定的最长等待秒数
+    auto_bind_poll_interval: int = 3   # 轮询空闲会话的间隔秒数
     screen_cols: int = 200
     marker_prefix: str = "__XSH_"
     log_dir: str = ""
@@ -44,6 +46,10 @@ def load_config() -> XshellConfig:
         cfg.ipc_base = v
     if v := os.getenv("XSH_DEFAULT_TIMEOUT"):
         cfg.default_timeout = int(v)
+    if v := os.getenv("XSH_AUTO_BIND_TIMEOUT"):
+        cfg.auto_bind_timeout = int(v)
+    if v := os.getenv("XSH_AUTO_BIND_POLL_INTERVAL"):
+        cfg.auto_bind_poll_interval = int(v)
     if v := os.getenv("XSH_SCREEN_COLS"):
         cfg.screen_cols = int(v)
     if v := os.getenv("XSH_LOG_DIR"):

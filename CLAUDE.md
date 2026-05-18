@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Xshell MCP — 一个 MCP (Model Context Protocol) 服务器，让大模型通过 Xshell 终端执行命令。通过文件 IPC 与 Xshell 内运行的 Bridge 脚本通信。
 
+**v0.2.0 起支持多会话并发**：多个 Claude Code 窗口可分别绑定到不同的 XShell 页签并发执行命令；XShell 页签关闭 / SSH 断联后自动释放占用。
+
 ## 命令
 
 ```bash
@@ -30,50 +32,79 @@ pytest xshell-mcp/tests/test_output_processor.py::TestCleanCommandOutput -v
 
 ## 架构
 
-三层通信模型：
+四层通信模型（多会话）：
 
 ```
-LLM (Claude) ←→ MCP Server (server.py) ←→ Bridge Client (bridge_client.py) ←→ 文件 IPC ←→ Bridge 脚本 (xshell_bridge_v6.11.py, 在 Xshell 内运行)
+LLM (Claude) ←→ MCP Server (server.py)
+                     │
+                     ├── SessionManager (session_manager.py) ── 注册扫描 + CAS 绑定
+                     │
+                     └── Bridge Client (bridge_client.py) ←→ 文件 IPC ←→ Bridge 脚本 (xshell_bridge_v7.py, 在 XShell 内多页签并发运行)
 ```
+
+每个 XShell 页签内独立运行 Bridge 脚本，启动时按 `session_<PID>` 写注册文件并将自身页签名也修改为 `session_<PID>`，便于辨认；MCP Server 通过 `connect_session()` 一次性 CAS 绑定到某个会话，之后该 Server 实例只会读写该会话的 IPC 目录。
 
 ### 核心模块
 
 | 模块 | 职责 |
 |------|------|
-| `server.py` | FastMCP 服务器，定义 6 个工具函数作为外部 API，每个调用生成 `request_id` 并记录入口/出口日志 |
-| `bridge_client.py` | 通过 `.request.json` / `.response.json` 文件与 Bridge 进行 IPC 通信，接收 `request_id` 传入 `_send_request` 做链路追踪 |
-| `bridge/xshell_bridge_v6.11.py` | 在 Xshell 内部运行，使用 `xsh.Screen.Send()` 执行命令并轮询 marker 检测输出完成 |
+| `server.py` | FastMCP 服务器，定义 10 个工具函数：原 6 个执行类（`execute_command` / `send_raw` / `read_screen` 等）+ 新增 4 个会话管理类（`list_sessions` / `connect_session` / `disconnect_session` / `get_bridge_info`），未绑定时执行类工具抛 `SessionNotBoundError` |
+| `session_manager.py` | 扫描 `ipc/registry/*.json` 发现 Bridge；`bind()` 采用 CAS（读→检查 `bound_by==0`→写→sleep 50ms→再读校验）防并发抢占；`check_stale_bindings()` 通过 Windows ctypes `kernel32.OpenProcess` 检测 PID 存活回收幽灵占用 |
+| `bridge_client.py` | 通过 `.request.json` / `.response.json` 与某个会话 Bridge 通信，`_send_request` 受 `threading.Lock` 保护避免并发 IPC 错乱，接收 `request_id` 做链路追踪 |
+| `bridge/xshell_bridge_v7.py` | 在 XShell 页签内运行，启动时 `SESSION_ID = "session_" + str(os.getpid())`，写入 `ipc/registry/<session>.json`，把 `xsh.Session.TabText` 改为 SESSION_ID，定期心跳更新 `last_heartbeat`，退出时清理注册；保留 v6.11 的命令执行 + marker 轮询逻辑 |
 | `protocol.py` | IPC 的 `Request` / `Response` 数据类 |
 | `output_processor.py` | 清理 ANSI 转义序列、命令回显、marker 行和提示符，从原始终端输出中提取命令结果 |
-| `xshell_launcher.py` | 通过 `Xshell.exe -script <bridge>` 启动 Xshell |
-| `config.py` | 基于环境变量的配置（路径、超时、日志等） |
-| `log_config.py` | 文件日志配置：`RotatingFileHandler`（500KB/5 文件）、`contextvars` 注入 `request_id`、日志脱敏 |
+| `xshell_launcher.py` | 通过 `Xshell.exe -script <bridge>` 启动 XShell；`get_bridge_guidance()` 返回引导用户启动 Bridge + 调用 `connect_session()` 的提示文本 |
+| `config.py` | 基于环境变量的配置；新增 `ipc_base` 字段（默认 `<pkg>/ipc`），`bridge_script_path` 默认改为 `xshell_bridge_v7.py` |
+| `log_config.py` | 文件日志：`RotatingFileHandler`、`contextvars` 注入 `request_id` + `session_id`、日志脱敏；日志格式 `[asctime] [session_id] [request_id] ...` |
+| `exceptions.py` | 多会话异常：`SessionNotFoundError` / `SessionOccupiedError` / `SessionNotBoundError` |
 
-### 数据流（命令执行）
+### 数据流
+
+#### 会话绑定流程（启动后一次性）
+
+1. 用户在每个 XShell 页签内运行 `xshell_bridge_v7.py`，Bridge 写注册文件 `ipc/registry/session_<PID>.json` 并把页签名设为 `session_<PID>`
+2. MCP Server 启动 → `_init_session_manager()` 扫描 registry → 若仅 1 个空闲会话则自动 CAS 绑定，否则等待 LLM 调用 `list_sessions()` 选择并 `connect_session(session_id)`
+3. CAS 绑定：读取注册文件 → 检查 `bound_by == 0` → 写入 `bound_by = <PID>` → sleep 50ms → 再读验证；冲突则抛 `SessionOccupiedError`
+4. 绑定成功后 `_bound_session_id` / `_bound_client` 被设置，后续所有命令工具复用此 client
+
+#### 命令执行流程
 
 1. LLM 调用 MCP 工具 `execute_command("ls -la")`
-2. `server.py` 生成 `request_id`（格式 `ttttt-nnnnn`），注入 `contextvars`，记录入口日志（cmd、timeout）
-3. `server.py` 将 `request_id` 传入 `bridge_client.execute()`，创建带唯一 marker 的 `Request`
-4. `bridge_client.py` 将请求写入 `%TEMP%\xshell_mcp\.request.json`，记录 IPC 请求日志
-5. Bridge 脚本每 200ms 轮询该文件，检测到变化后读取请求
-6. Bridge 检测 shell 类型（CMD → `&`，Bash/PowerShell → `;`），发送 `cmd ; echo MARKER`
-7. Bridge 轮询终端直到出现 marker，读取屏幕行作为原始输出
-8. Bridge 将 `Response` 写入 `.response.json`
-9. `bridge_client.py` 读取响应，记录 IPC 响应日志（success、output_len、elapsed）
-10. `server.py` 的 `output_processor.py` 清理输出，记录出口日志（elapsed、output_len、timed_out）
+2. `server.py` 生成 `request_id`，注入 `contextvars`（含 `session_id`），记录入口日志
+3. 通过 `_bound_client` 写入 `ipc/sessions/session_<PID>/.request.json`
+4. Bridge 每 200ms 轮询该文件，发送 `cmd ; echo MARKER`，轮询终端直到出现 marker
+5. Bridge 写 `.response.json`，client 读取并清理输出，回工具返回值
+6. 命令期间若 `BridgeTimeoutError`，server 二次检查 Bridge 存活，若注册文件缺失或 PID 死亡则解绑
 
-### IPC 协议
+#### 退出与清理
 
-- 文件 IPC 目录：`%TEMP%\xshell_mcp\`（可通过 `XSH_IPC_DIR` 覆盖）
-- 请求文件：`.request.json`，响应文件：`.response.json`
-- Bridge 客户端在写入新请求前删除旧响应文件，使用 `.tmp` + 原子 rename 保证写入完整性
-- 轮询间隔：Bridge 端 200ms，客户端端 100ms
+- Bridge 进程退出（页签关闭 / SSH 断联）：`atexit` 删注册文件
+- MCP Server 进程退出：`atexit` 调用 `_cleanup_on_exit()` 清除 `bound_by` 标记
+- 异常崩溃：下个 Server 启动扫描时通过 PID 存活检测自动回收
+
+### IPC 协议（v0.2.0）
+
+```
+<XSH_IPC_BASE>/                 默认 <pkg>/ipc
+├── registry/                   会话注册文件目录
+│   └── session_<PID>.json      含 bridge_pid / bound_by / last_heartbeat / session_name / tab_text 等字段
+└── sessions/
+    └── session_<PID>/          每个会话独立的 IPC 目录
+        ├── .request.json
+        └── .response.json
+```
+
+- 注册文件 / 请求 / 响应文件均以 `.tmp` + `os.replace()` 原子写
+- 心跳超过 5 分钟视为失联
+- 轮询间隔：Bridge 端 200ms，client 端 100ms
+- **Legacy 模式**：当 `XSH_IPC_DIR` 已设置且 `XSH_IPC_BASE` 未设置时，回退单会话直连模式（Bridge v7 也会跳过注册流程），确保旧用法仍可用
 
 ### 日志系统
 
 - 日志文件：`logs/xshell_mcp.log`（通过 `XSH_LOG_DIR` 可配置）
-- 格式：`时间(ms) 级别 [request_id] 文件:行号 函数名() | 消息`
-- `request_id` 通过 `contextvars` 注入，自动串联 server → bridge_client 的同一调用链路
+- 格式：`时间(ms) 级别 [session_id] [request_id] 文件:行号 函数名() | 消息`
+- `request_id` 与 `session_id` 通过 `contextvars` 注入，自动串联 server → bridge_client 的同一调用链路
 - `RotatingFileHandler`：单文件 500KB，保留 5 个历史文件
 - 输出内容只记录长度（`output_len`），不记录原文
 - `send_raw` 的 `text` 参数可通过 `XSH_LOG_MASK_SENSITIVE=true` 脱敏
@@ -81,8 +112,9 @@ LLM (Claude) ←→ MCP Server (server.py) ←→ Bridge Client (bridge_client.p
 ### 配置（环境变量）
 
 - `XSH_XSHELL_PATH` — Xshell.exe 路径
-- `XSH_BRIDGE_SCRIPT` — Bridge 脚本路径（默认为 `bridge/xshell_bridge_v6.11.py`）
-- `XSH_IPC_DIR` — IPC 目录（默认为 `%TEMP%\xshell_mcp`）
+- `XSH_BRIDGE_SCRIPT` — Bridge 脚本路径（默认 `bridge/xshell_bridge_v7.py`）
+- `XSH_IPC_BASE` — 多会话 IPC 根目录（默认 `<pkg>/ipc`），下含 `registry/` 和 `sessions/`
+- `XSH_IPC_DIR` — Legacy 单会话 IPC 目录；与 `XSH_IPC_BASE` 互斥，仅设此项时进入 legacy 模式
 - `XSH_DEFAULT_TIMEOUT` — 命令超时秒数（默认 30）
 - `XSH_SCREEN_COLS` — 屏幕列宽（默认 200）
 - `XSH_LOG_DIR` — 日志目录（默认为项目根 `logs/`）

@@ -1,7 +1,6 @@
 """Xshell MCP Server 入口"""
-
-import logging
 import sys
+import traceback
 
 
 def main():
@@ -13,20 +12,28 @@ def main():
 
     setup_logging(cfg.log_dir, cfg.log_level)
 
+    import logging
     logger = logging.getLogger("xshell_mcp")
     logger.info("Xshell MCP Server 启动中...")
+    logger.debug("log_dir=%s ipc_base=%s ipc_dir=%s",
+                 cfg.log_dir, cfg.ipc_base, cfg.ipc_dir)
 
-    from .server import _init_session_manager, mcp
+    from .server import _init_session_manager, start_auto_bind, mcp
 
     try:
         _init_session_manager()
     except Exception as e:
-        logger.warning("Session Manager 初始化失败: %s", e)
-        logger.warning("将继续启动 MCP Server，请在 XShell 中运行 xshell_bridge_v7.py 脚本")
+        logger.warning("Session Manager 初始化失败: %s", e, exc_info=True)
+
+    start_auto_bind()
 
     logger.info("MCP Server 就绪，等待通过 connect_session() 绑定 XShell 会话")
     mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)

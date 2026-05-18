@@ -13,7 +13,7 @@ from .exceptions import SessionNotFoundError, SessionOccupiedError
 logger = logging.getLogger("xshell_mcp")
 
 # 心跳超时阈值（秒）— 超过此时间未更新心跳则视为 bridge 可能已死
-_HEARTBEAT_TIMEOUT = 300  # 5 分钟
+_HEARTBEAT_TIMEOUT = 600  # 10 分钟（Bridge 心跳间隔 60s，10min 足够覆盖深空闲模式）
 
 
 class SessionManager:
@@ -42,7 +42,7 @@ class SessionManager:
                 continue
             # 检查 bridge 是否存活
             if not self._is_bridge_alive(session_id):
-                logger.debug("发现已死亡的 bridge: %s，跳过", session_id)
+                logger.info("发现已死亡的 bridge（心跳过期或进程不存在）: %s，跳过", session_id)
                 continue
             # 附加占用状态描述
             bound_by = info.get("bound_by", 0)
@@ -151,15 +151,28 @@ class SessionManager:
         logger.info("已解绑 session=%s", session_id)
 
     def check_stale_bindings(self):
-        """清理幽灵占用：检查所有注册文件中 bound_by PID 是否还活着"""
+        """清理幽灵占用和僵尸注册文件"""
         if not self._registry_dir.exists():
             return
         for reg_file in self._registry_dir.glob("session_*.json"):
             info = self._read_registry(reg_file)
             if info is None:
                 continue
+            session_id = info.get("session_id", "")
             bound_by = info.get("bound_by", 0)
-            if bound_by and not self._is_process_alive(bound_by):
+
+            bridge_alive = self._is_bridge_alive(session_id) if session_id else False
+            bounder_alive = self._is_process_alive(bound_by) if bound_by else False
+
+            if not bridge_alive:
+                # bridge 进程已死（心跳过期），清理僵尸注册文件
+                reg_file.unlink(missing_ok=True)
+                logger.warning("清理僵尸注册文件: %s（心跳已过期，session_id=%s）",
+                             reg_file.name, session_id)
+                continue
+
+            if bound_by and not bounder_alive:
+                # 仅 bound_by 幽灵占用，释放即可；bridge 本身还活着
                 self._release_binding(reg_file, info)
 
     def get_session_info(self, session_id: str) -> dict | None:

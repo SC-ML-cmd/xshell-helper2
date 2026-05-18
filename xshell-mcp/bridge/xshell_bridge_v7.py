@@ -44,8 +44,8 @@ class BridgeConfig:
     # 容错
     MAX_ERRORS = 3
 
-    # 日志
-    HEARTBEAT_INTERVAL = 100
+    # 心跳间隔（秒），时间驱动，不受 sleep 策略影响
+    HEARTBEAT_INTERVAL_SEC = 60
 
 
 CFG = BridgeConfig()
@@ -269,6 +269,13 @@ def _write_registry():
     _write_json_file(reg_file, reg_data)
     _log("REGISTRY written: %s" % reg_file)
 
+    # 修改 XShell 页签名为 SESSION_ID，便于用户辨认
+    try:
+        xsh.Session.TabText = SESSION_ID
+        _log("TABTITLE set to: %s" % SESSION_ID)
+    except Exception as e:
+        _log("TABTITLE set failed (ignored): %s" % e)
+
 
 def _update_registry_heartbeat():
     """心跳时更新注册文件的 last_heartbeat"""
@@ -456,6 +463,7 @@ def Main():
     })
 
     last_mtime = os.path.getmtime(REQ_FILE) if os.path.isfile(REQ_FILE) else 0
+    last_hb_time = time.time()
     iteration = 0
     error_count = 0
     exit_reason = "unknown"
@@ -503,10 +511,12 @@ def Main():
             _smart_sleep(1000)
 
         iteration += 1
-        if iteration % CFG.HEARTBEAT_INTERVAL == 0:
+        now = time.time()
+        if now - last_hb_time >= CFG.HEARTBEAT_INTERVAL_SEC:
             _log("MAIN heartbeat iter=%d errors=%d sleep=%dms connected=%s" % (
                 iteration, error_count, _get_sleep_ms(), _session_cache["connected"]))
             _update_registry_heartbeat()
+            last_hb_time = now
 
     _log("EXIT reason=%s iteration=%d errors=%d" % (exit_reason, iteration, error_count))
 
