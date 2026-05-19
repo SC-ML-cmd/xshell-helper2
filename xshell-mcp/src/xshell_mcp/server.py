@@ -511,6 +511,10 @@ def _init_session_manager():
     # 正常多会话路径
     _session_manager = SessionManager(_config.ipc_base, timeout=_config.default_timeout)
 
+    # 清理僵尸注册文件 + 已退出 session 目录
+    _session_manager.check_stale_bindings()
+    _session_manager.cleanup_stale_session_dirs()
+
     sessions = _session_manager.discover()
     if sessions:
         logger.info("发现 %d 个已注册的 bridge", len(sessions))

@@ -4,6 +4,7 @@ import json
 import ctypes
 import logging
 import os
+import shutil
 import time
 from pathlib import Path
 
@@ -175,6 +176,27 @@ class SessionManager:
                 # 仅 bound_by 幽灵占用，释放即可；bridge 本身还活着
                 self._release_binding(reg_file, info)
 
+    def cleanup_stale_session_dirs(self):
+        """清理已退出 bridge 遗留的 session 目录
+
+        遍历 ipc/sessions/ 下所有 session_* 目录，
+        若对应 registry 中没有注册文件，则该 session 已退出，删除目录。
+        """
+        if not self._sessions_dir.exists():
+            return
+        active_sessions = set()
+        if self._registry_dir.exists():
+            for reg_file in self._registry_dir.glob("session_*.json"):
+                active_sessions.add(reg_file.stem)  # 去掉 .json
+        for session_dir in self._sessions_dir.iterdir():
+            if not session_dir.is_dir():
+                continue
+            if not session_dir.name.startswith("session_"):
+                continue
+            if session_dir.name not in active_sessions:
+                _rmtree(session_dir)
+                logger.warning("清理已退出 session 目录: %s", session_dir)
+
     def get_session_info(self, session_id: str) -> dict | None:
         """读取指定 session 的注册信息"""
         reg_file = self._registry_dir / f"{session_id}.json"
@@ -246,3 +268,11 @@ class SessionManager:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(tmp, str(reg_file))
+
+
+def _rmtree(path: Path):
+    """删除目录树，忽略文件不存在等错误"""
+    try:
+        shutil.rmtree(str(path))
+    except OSError as e:
+        logger.warning("删除目录失败 %s: %s", path, e)
