@@ -269,16 +269,16 @@ def _write_registry():
     _write_json_file(reg_file, reg_data)
     _log("REGISTRY written: %s" % reg_file)
 
-    # 修改 XShell 页签名为 SESSION_ID，便于用户辨认
+    # 修改 XShell 页签名为 SESSION_ID [未绑定]，便于用户辨认绑定状态
     try:
-        xsh.Session.TabText = SESSION_ID
-        _log("TABTITLE set to: %s" % SESSION_ID)
+        xsh.Session.TabText = SESSION_ID + " [未绑定]"
+        _log("TABTITLE set to: %s [未绑定]" % SESSION_ID)
     except Exception as e:
         _log("TABTITLE set failed (ignored): %s" % e)
 
 
 def _update_registry_heartbeat():
-    """心跳时更新注册文件的 last_heartbeat"""
+    """心跳时更新注册文件的 last_heartbeat 和页签绑定状态"""
     if REGISTRY_DIR is None:
         return
     reg_file = os.path.join(REGISTRY_DIR, SESSION_ID + ".json")
@@ -288,6 +288,21 @@ def _update_registry_heartbeat():
         reg_data["last_heartbeat"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         reg_data["connected"] = _safe_call(lambda: xsh.Session.Connected, False)
         _write_json_file(reg_file, reg_data)
+
+        # 根据 bound_by 动态更新 XShell 页签标题
+        bound_by = reg_data.get("bound_by", 0)
+        if bound_by == 0:
+            new_title = SESSION_ID + " [未绑定]"
+        else:
+            new_title = SESSION_ID + " [已绑定:" + str(bound_by) + "]"
+
+        current_title = _safe_call(lambda: xsh.Session.TabText, "")
+        if current_title != new_title:
+            try:
+                xsh.Session.TabText = new_title
+                _log("TABTITLE updated: %s" % new_title)
+            except Exception as e:
+                _log("TABTITLE update failed (ignored): %s" % e)
     except Exception as e:
         _log("REGISTRY heartbeat update failed: %s" % e)
 

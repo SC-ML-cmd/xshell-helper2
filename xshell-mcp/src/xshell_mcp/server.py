@@ -229,8 +229,8 @@ def get_screen(lines: int = 50) -> dict:
 
 
 @mcp.tool()
-def get_session_info() -> dict:
-    """获取当前 Xshell 终端状态信息"""
+def get_terminal_size() -> dict:
+    """获取当前 Xshell 终端的行数和列数（screen_rows / screen_cols）。"""
     rid = generate_request_id()
     set_request_id(rid)
 
@@ -443,7 +443,10 @@ def get_bridge_info() -> dict:
     """返回当前绑定的 XShell 会话信息。
 
     包括 session_id、bridge PID、远程地址等，用于确认当前 Claude Code 窗口对应哪个 XShell 页签。
+    若检测到 Bridge 已断连则自动解绑。
     """
+    global _bound_session_id, _bound_client
+
     rid = generate_request_id()
     set_request_id(rid)
 
@@ -461,6 +464,15 @@ def get_bridge_info() -> dict:
             "ipc_dir": _config.ipc_dir,
             "mode": "legacy",
         }
+
+    # 检测到 Bridge 已死则自动清理僵尸绑定
+    if not info:
+        old_session = _bound_session_id
+        logger.warning("绑定会话 %s 已断连（注册文件不存在），自动解绑", old_session)
+        _bound_session_id = None
+        _bound_client = None
+        set_session_id("")
+        return {"bound": False, "message": f"会话 {old_session} 已断连，已自动解绑"}
 
     return {
         "bound": True,
