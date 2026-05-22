@@ -8,7 +8,7 @@ import logging
 
 from mcp.server.fastmcp import FastMCP
 
-from .config import load_config
+from .config import load_config, load_log_config, LogConfig
 from .bridge_client import BridgeClient
 from .session_manager import SessionManager
 from .output_processor import clean_command_output, truncate_output
@@ -21,6 +21,14 @@ from .exceptions import (
     SessionOccupiedError,
 )
 from .log_config import get_logger, generate_request_id, set_request_id, set_session_id
+from .log_analyzer import (
+    build_search_command,
+    build_extract_command,
+    build_filter_command,
+    build_context_command,
+    generate_cache_filename,
+    parse_extract_result,
+)
 
 logger = get_logger("xshell_mcp")
 
@@ -31,6 +39,7 @@ logger = get_logger("xshell_mcp")
 mcp = FastMCP("xshell-mcp")
 
 _config = load_config()
+_log_config: LogConfig | None = load_log_config()
 _bound_session_id: str | None = None
 _bound_client: BridgeClient | None = None
 _session_manager: SessionManager | None = None
@@ -244,6 +253,184 @@ def get_terminal_size() -> dict:
         "screen_rows": resp.screen_rows,
         "screen_cols": resp.screen_cols,
     }
+
+
+# ============================================================
+# 日志分析工具
+# ============================================================
+
+@mcp.tool()
+def search_logs(
+    keyword: str,
+    mode: str = "search",
+    file_pattern: str = "",
+    time_range: str = "",
+    max_lines: int = 50,
+    context_lines: int = 0,
+    offset: int = 0,
+    before: int = 20,
+    after: int = 50,
+    file_path: str = "",
+    occurrence: int = 1,
+    cache_file: str = "",
+    timeout: int = 60,
+) -> dict:
+    """在远程 POD 日志中搜索关键字（支持 .gz 压缩文件）。
+
+    四种模式：
+    - mode="search":  直接搜索原始日志文件（适合无明确关键字时探索）
+    - mode="extract": 原子化提取所有匹配行到临时缓存文件（解决日志轮转竞态）
+    - mode="filter":  在缓存文件上二次过滤（如从 traceId 结果中筛 ERROR）
+    - mode="context": 获取指定匹配的上下文（查看完整堆栈）
+
+    双路径工作流：
+    - 有明确关键字(traceId等): extract → filter → context
+    - 无明确关键字(探索性): search(时间+级别) → 发现线索后 extract
+
+    日志目录和文件格式从项目配置 .xshell-log.json 自动读取。
+
+    Args:
+        keyword: 搜索关键字（traceId、异常类名、ERROR、日志内容等）
+        mode: 工作模式 - "search" / "extract" / "filter" / "context"
+        file_pattern: 文件过滤（如 ossres-dws.log.4*.gz），为空则搜索配置中所有日志
+        time_range: 时间范围过滤（如 "14:30-14:35"），配合 timestamp_format 使用
+        max_lines: [search/filter] 最大返回行数（默认50）
+        context_lines: [search] 每个匹配的上下文行数
+        offset: [search/filter] 跳过前 N 行（分页用）
+        before: [context] 匹配前显示行数（默认20）
+        after: [context] 匹配后显示行数（默认50，堆栈通常在后面）
+        file_path: [context] 指定文件路径
+        occurrence: [context] 第几次匹配（默认第1次）
+        cache_file: [filter/context] 指定缓存文件路径（extract返回的路径）
+        timeout: 超时秒数（压缩文件搜索建议60-120）
+    """
+    rid = generate_request_id()
+    set_request_id(rid)
+
+    client = get_client()
+    marker = "{}{}".format(_config.marker_prefix, int(time.time() * 1000000))
+
+    # 获取日志配置
+    log_dir = ""
+    compressed_ext = [".gz"]
+    max_extract = 10000
+
+    if _log_config:
+        log_dir = _log_config.log_dir
+        compressed_ext = _log_config.compressed_extensions
+        max_extract = _log_config.max_extract_lines
+        if not file_pattern:
+            file_pattern = _log_config.file_pattern
+
+    # 无配置且无 file_pattern 时报错
+    if not log_dir and mode in ("search", "extract"):
+        return {"error": "未找到日志配置(.xshell-log.json)且未指定 file_pattern，无法确定搜索范围"}
+
+    logger.info("search_logs mode=%s keyword=%.40s file_pattern=%s", mode, keyword, file_pattern)
+
+    try:
+        t0 = time.time()
+        if mode == "search":
+            cmd = build_search_command(
+                keyword=keyword,
+                log_dir=log_dir,
+                file_pattern=file_pattern,
+                compressed_extensions=compressed_ext,
+                time_range=time_range,
+                max_lines=max_lines,
+                offset=offset,
+                context_lines=context_lines,
+            )
+            resp = client.execute(cmd, marker, timeout=timeout, request_id=rid)
+            output = clean_command_output(resp.output, cmd, marker)
+
+            lines = output.strip().split("\n") if output.strip() else []
+            elapsed = time.time() - t0
+            logger.info("search_logs 完成 mode=search elapsed=%.2fs lines=%d", elapsed, len(lines))
+            return {
+                "output": output,
+                "lines_returned": len(lines),
+                "has_more": len(lines) >= max_lines,
+                "timed_out": resp.timed_out,
+                "command": cmd,
+            }
+
+        elif mode == "extract":
+            cache_path = generate_cache_filename()
+            cmd = build_extract_command(
+                keyword=keyword,
+                log_dir=log_dir,
+                file_pattern=file_pattern,
+                max_extract_lines=max_extract,
+                cache_path=cache_path,
+            )
+            resp = client.execute(cmd, marker, timeout=timeout, request_id=rid)
+            output = clean_command_output(resp.output, cmd, marker)
+
+            result = parse_extract_result(output, cache_path)
+            result["timed_out"] = resp.timed_out
+            result["command"] = cmd
+            elapsed = time.time() - t0
+            logger.info("search_logs 完成 mode=extract elapsed=%.2fs total_lines=%d cache=%s",
+                        elapsed, result.get("total_lines", 0), cache_path)
+            return result
+
+        elif mode == "filter":
+            if not cache_file:
+                return {"error": "filter 模式需要指定 cache_file（由 extract 模式返回）"}
+            cmd = build_filter_command(
+                keyword=keyword,
+                cache_file=cache_file,
+                max_lines=max_lines,
+                offset=offset,
+            )
+            resp = client.execute(cmd, marker, timeout=timeout, request_id=rid)
+            output = clean_command_output(resp.output, cmd, marker)
+
+            lines = output.strip().split("\n") if output.strip() else []
+            elapsed = time.time() - t0
+            logger.info("search_logs 完成 mode=filter elapsed=%.2fs lines=%d", elapsed, len(lines))
+            return {
+                "output": output,
+                "lines_returned": len(lines),
+                "has_more": len(lines) >= max_lines,
+                "timed_out": resp.timed_out,
+                "command": cmd,
+            }
+
+        elif mode == "context":
+            target_file = file_path or cache_file
+            if not target_file:
+                return {"error": "context 模式需要指定 file_path 或 cache_file"}
+            cmd = build_context_command(
+                file_path=target_file,
+                keyword=keyword,
+                before=before,
+                after=after,
+                occurrence=occurrence,
+                compressed_extensions=compressed_ext,
+            )
+            resp = client.execute(cmd, marker, timeout=timeout, request_id=rid)
+            output = clean_command_output(resp.output, cmd, marker)
+
+            elapsed = time.time() - t0
+            logger.info("search_logs 完成 mode=context elapsed=%.2fs file=%s", elapsed, target_file)
+            return {
+                "output": output,
+                "file": target_file,
+                "timed_out": resp.timed_out,
+                "command": cmd,
+            }
+        else:
+            return {"error": f"未知模式: {mode}，支持的模式: search/extract/filter/context"}
+
+    except BridgeTimeoutError:
+        logger.warning("search_logs 超时 mode=%s timeout=%ds", mode, timeout)
+        return {
+            "output": "",
+            "timed_out": True,
+            "error": f"日志搜索超时 ({timeout}s)，压缩文件较多时请增加 timeout 参数",
+        }
 
 
 # ============================================================

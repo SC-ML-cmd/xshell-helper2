@@ -1,3 +1,5 @@
+import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -32,9 +34,55 @@ class XshellConfig:
             self.log_dir = str(pkg_dir / "logs")
 
 
-def load_config() -> XshellConfig:
-    import os
+@dataclass
+class LogConfig:
+    log_dir: str = "/logs"
+    file_pattern: str = "*.log*"
+    compressed_extensions: list = field(default_factory=lambda: [".gz"])
+    log_format: str = "logback"
+    timestamp_format: str = "yyyy-MM-dd HH:mm:ss.SSS"
+    file_naming: str = ""
+    max_extract_lines: int = 10000
+    description: str = ""
 
+
+def load_log_config() -> LogConfig | None:
+    """加载项目日志配置文件。
+
+    查找顺序：
+    1. 环境变量 XSH_LOG_CONFIG 指定的路径
+    2. 当前工作目录下的 .xshell-log.json
+
+    Returns:
+        LogConfig 实例，如未找到配置文件则返回 None
+    """
+    config_path = os.getenv("XSH_LOG_CONFIG", "")
+    if not config_path:
+        config_path = Path.cwd() / ".xshell-log.json"
+    else:
+        config_path = Path(config_path)
+
+    if not config_path.exists():
+        return None
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return LogConfig(
+            log_dir=data.get("log_dir", "/logs"),
+            file_pattern=data.get("file_pattern", "*.log*"),
+            compressed_extensions=data.get("compressed_extensions", [".gz"]),
+            log_format=data.get("log_format", "logback"),
+            timestamp_format=data.get("timestamp_format", "yyyy-MM-dd HH:mm:ss.SSS"),
+            file_naming=data.get("file_naming", ""),
+            max_extract_lines=data.get("max_extract_lines", 10000),
+            description=data.get("description", ""),
+        )
+    except (json.JSONDecodeError, IOError):
+        return None
+
+
+def load_config() -> XshellConfig:
     cfg = XshellConfig()
     if v := os.getenv("XSH_XSHELL_PATH"):
         cfg.xshell_path = v

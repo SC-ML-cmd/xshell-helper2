@@ -33,8 +33,8 @@ class BridgeConfig:
 
     # Sleep 策略
     COM_SLEEP_MS = 500           # 活跃期
-    IDLE_SLEEP_MS = 5000         # 低活跃期（3分钟无 IPC）
-    DEEP_IDLE_SLEEP_MS = 30000   # 空闲期（10分钟无 exec）
+    IDLE_SLEEP_MS = 1000         # 低活跃期（3分钟无 IPC）
+    DEEP_IDLE_SLEEP_MS = 2000   # 空闲期（10分钟无 exec）
     IDLE_THRESHOLD_SEC = 180
     DEEP_IDLE_THRESHOLD_SEC = 600
 
@@ -269,10 +269,10 @@ def _write_registry():
     _write_json_file(reg_file, reg_data)
     _log("REGISTRY written: %s" % reg_file)
 
-    # 修改 XShell 页签名为 SESSION_ID [未绑定]，便于用户辨认绑定状态
+    # 修改 XShell 页签名为 SESSION_ID [free]，便于用户辨认绑定状态
     try:
-        xsh.Session.TabText = SESSION_ID + " [未绑定]"
-        _log("TABTITLE set to: %s [未绑定]" % SESSION_ID)
+        xsh.Session.TabText = SESSION_ID + " [free]"
+        _log("TABTITLE set to: %s [free]" % SESSION_ID)
     except Exception as e:
         _log("TABTITLE set failed (ignored): %s" % e)
 
@@ -292,9 +292,9 @@ def _update_registry_heartbeat():
         # 根据 bound_by 动态更新 XShell 页签标题
         bound_by = reg_data.get("bound_by", 0)
         if bound_by == 0:
-            new_title = SESSION_ID + " [未绑定]"
+            new_title = SESSION_ID + " [free]"
         else:
-            new_title = SESSION_ID + " [已绑定:" + str(bound_by) + "]"
+            new_title = SESSION_ID + " [bound:" + str(bound_by) + "]"
 
         current_title = _safe_call(lambda: xsh.Session.TabText, "")
         if current_title != new_title:
