@@ -36,4 +36,6 @@ logs
 # IPC runtime directories
 ipc/
 **/ipc/
+.agents
+AGENTS.md
 

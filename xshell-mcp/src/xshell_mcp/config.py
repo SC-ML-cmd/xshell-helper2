@@ -1,4 +1,3 @@
-import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -46,40 +45,43 @@ class LogConfig:
     description: str = ""
 
 
-def load_log_config() -> LogConfig | None:
-    """加载项目日志配置文件。
+def _split_csv_env(value: str | None, default: list[str]) -> list[str]:
+    """将逗号分隔环境变量解析为字符串列表。"""
+    if not value:
+        return default
+    items = [item.strip() for item in value.split(",")]
+    filtered = [item for item in items if item]
+    return filtered or default
 
-    查找顺序：
-    1. 环境变量 XSH_LOG_CONFIG 指定的路径
-    2. 当前工作目录下的 .xshell-log.json
 
-    Returns:
-        LogConfig 实例，如未找到配置文件则返回 None
+def load_log_config() -> LogConfig:
+    """加载日志检索配置（项目级配置，来自 MCP 参数/环境变量）。
+
+    说明：
+    - 不再依赖 .xshell-log.json；
+    - 由 config.py 默认值 + 环境变量覆盖组成；
+    - 一个项目只需配置一次，search_logs 调用时直接复用。
     """
-    config_path = os.getenv("XSH_LOG_CONFIG", "")
-    if not config_path:
-        config_path = Path.cwd() / ".xshell-log.json"
-    else:
-        config_path = Path(config_path)
+    cfg = LogConfig()
 
-    if not config_path.exists():
-        return None
+    if v := os.getenv("XSH_SEARCH_LOG_DIR"):
+        cfg.log_dir = v
+    if v := os.getenv("XSH_SEARCH_FILE_PATTERN"):
+        cfg.file_pattern = v
+    if v := os.getenv("XSH_SEARCH_COMPRESSED_EXTENSIONS"):
+        cfg.compressed_extensions = _split_csv_env(v, [".gz"])
+    if v := os.getenv("XSH_SEARCH_LOG_FORMAT"):
+        cfg.log_format = v
+    if v := os.getenv("XSH_SEARCH_TIMESTAMP_FORMAT"):
+        cfg.timestamp_format = v
+    if v := os.getenv("XSH_SEARCH_FILE_NAMING"):
+        cfg.file_naming = v
+    if v := os.getenv("XSH_SEARCH_MAX_EXTRACT_LINES"):
+        cfg.max_extract_lines = int(v)
+    if v := os.getenv("XSH_SEARCH_LOG_DESCRIPTION"):
+        cfg.description = v
 
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return LogConfig(
-            log_dir=data.get("log_dir", "/logs"),
-            file_pattern=data.get("file_pattern", "*.log*"),
-            compressed_extensions=data.get("compressed_extensions", [".gz"]),
-            log_format=data.get("log_format", "logback"),
-            timestamp_format=data.get("timestamp_format", "yyyy-MM-dd HH:mm:ss.SSS"),
-            file_naming=data.get("file_naming", ""),
-            max_extract_lines=data.get("max_extract_lines", 10000),
-            description=data.get("description", ""),
-        )
-    except (json.JSONDecodeError, IOError):
-        return None
+    return cfg
 
 
 def load_config() -> XshellConfig:

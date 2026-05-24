@@ -19,13 +19,16 @@ from .config import LogConfig  # re-export 便于上层模块统一导入
 __all__ = [
     "LogConfig",
     "build_search_command",
+    "build_estimate_command",
     "build_extract_command",
+    "build_extract_context_command",
     "build_filter_command",
     "build_context_command",
     "build_file_glob",
     "generate_cache_filename",
     "is_compressed",
     "parse_extract_result",
+    "parse_estimate_result",
 ]
 
 
@@ -91,6 +94,51 @@ def _pagination_suffix(offset: int, max_lines: int) -> str:
     return f" | tail -n +{offset + 1} | head -n {max_lines}"
 
 
+def _build_match_flags(
+    *,
+    use_extended: bool = False,
+    fixed_string: bool = False,
+    case_sensitive: bool = True,
+    context_lines: int = 0,
+    with_filename: bool = False,
+    with_line_number: bool = True,
+) -> str:
+    """构建 grep/zgrep 参数。"""
+    flags: list[str] = []
+    if with_filename:
+        flags.append("-H")
+    if with_line_number:
+        flags.append("-n")
+    if fixed_string:
+        flags.append("-F")
+    elif use_extended:
+        flags.append("-E")
+    if not case_sensitive:
+        flags.append("-i")
+    if context_lines and context_lines > 0:
+        flags.append(f"-C{int(context_lines)}")
+    return f" {' '.join(flags)}" if flags else ""
+
+
+def _parse_wc_total(raw_output: str) -> int:
+    """从命令输出中解析 `wc -l` 的结果行。"""
+    if not raw_output:
+        return 0
+
+    for line in reversed(raw_output.strip().splitlines()):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parts = stripped.split(None, 1)
+        if not parts:
+            continue
+        try:
+            return int(parts[0])
+        except ValueError:
+            continue
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # 公共 API
 # ---------------------------------------------------------------------------
@@ -133,6 +181,8 @@ def build_search_command(
     max_lines: int = 50,
     offset: int = 0,
     context_lines: int = 0,
+    fixed_string: bool = False,
+    case_sensitive: bool = True,
 ) -> str:
     """生成直接搜索命令（search 模式）。
 
@@ -152,23 +202,69 @@ def build_search_command(
     Returns:
         可在远端 shell 直接执行的单行命令字符串
     """
-    # 关键字与时间范围组合
+    # 固定字符串匹配与时间范围正则是互斥关系：有时间范围时回落到正则模式
     time_pattern = _build_time_pattern(time_range)
-    pattern = _combine_pattern(time_pattern, keyword)
-
-    # extended-regex 在拼接了 (a|b|c) 时是必需的
-    use_extended = bool(time_pattern)
-    extended_flag = " -E" if use_extended else ""
-
-    context_flag = f" -C{int(context_lines)}" if context_lines and context_lines > 0 else ""
+    use_fixed_string = bool(fixed_string and not time_pattern)
+    pattern = keyword if use_fixed_string else _combine_pattern(time_pattern, keyword)
+    flags = _build_match_flags(
+        use_extended=bool(time_pattern and not use_fixed_string),
+        fixed_string=use_fixed_string,
+        case_sensitive=case_sensitive,
+        context_lines=context_lines,
+        with_filename=False,
+        with_line_number=True,
+    )
 
     file_glob = build_file_glob(log_dir, file_pattern)
     quoted_pattern = shlex.quote(pattern)
 
     # 注：file_glob 中含有 *，需让 shell 自行展开，因此不引号
-    cmd = f"zgrep -n{extended_flag}{context_flag} {quoted_pattern} {file_glob}"
+    cmd = f"zgrep{flags} {quoted_pattern} {file_glob} 2>/dev/null"
     cmd += _pagination_suffix(offset, max_lines)
     return cmd
+
+
+def build_estimate_command(
+    keyword: str,
+    log_dir: str,
+    file_pattern: str,
+    max_extract_lines: int,
+    cache_path: str,
+    fixed_string: bool = False,
+    case_sensitive: bool = True,
+) -> str:
+    """生成 estimate 命令（统计 + 缓存一体化）。
+
+    一次命令完成：
+    1) 搜索并落缓存（冻结同一批数据）；
+    2) 统计匹配总行数；
+    3) 统计命中文件数和 top 文件分布。
+    """
+    file_glob = build_file_glob(log_dir, file_pattern)
+    quoted_pattern = shlex.quote(keyword)
+    quoted_cache = shlex.quote(cache_path)
+    limit = max(1, int(max_extract_lines))
+    flags = _build_match_flags(
+        fixed_string=fixed_string,
+        case_sensitive=case_sensitive,
+        with_filename=True,
+        with_line_number=True,
+    )
+
+    extract = (
+        f"zgrep{flags} {quoted_pattern} {file_glob} 2>/dev/null"
+        f" | head -n {limit} > {quoted_cache}"
+    )
+    summary = (
+        f"TOTAL=$(wc -l < {quoted_cache}); "
+        f"FILES=$(cut -d: -f1 {quoted_cache} | sort | uniq | wc -l); "
+        f"echo '__XSH_ESTIMATE_TOTAL__:'\"$TOTAL\"; "
+        f"echo '__XSH_ESTIMATE_FILES__:'\"$FILES\"; "
+        f"echo '__XSH_ESTIMATE_TOP_BEGIN__'; "
+        f"cut -d: -f1 {quoted_cache} | sort | uniq -c | sort -nr | head -n 20; "
+        f"echo '__XSH_ESTIMATE_TOP_END__'"
+    )
+    return f"{extract}; {summary}"
 
 
 def build_extract_command(
@@ -177,6 +273,8 @@ def build_extract_command(
     file_pattern: str,
     max_extract_lines: int,
     cache_path: str,
+    fixed_string: bool = False,
+    case_sensitive: bool = True,
 ) -> str:
     """生成提取缓存命令（extract 模式）。
 
@@ -193,12 +291,51 @@ def build_extract_command(
     quoted_pattern = shlex.quote(keyword)
     quoted_cache = shlex.quote(cache_path)
     limit = max(1, int(max_extract_lines))
+    flags = _build_match_flags(
+        fixed_string=fixed_string,
+        case_sensitive=case_sensitive,
+        with_filename=True,
+        with_line_number=True,
+    )
 
     extract = (
-        f"zgrep -H -n {quoted_pattern} {file_glob} 2>/dev/null"
+        f"zgrep{flags} {quoted_pattern} {file_glob} 2>/dev/null"
         f" | head -n {limit} > {quoted_cache}"
     )
     # 用分号串联：第一段写缓存，第二段返回缓存行数（供解析判断是否截断）
+    return f"{extract}; wc -l {quoted_cache}"
+
+
+def build_extract_context_command(
+    keyword: str,
+    log_dir: str,
+    file_pattern: str,
+    max_extract_lines: int,
+    cache_path: str,
+    before: int = 20,
+    after: int = 50,
+    fixed_string: bool = False,
+    case_sensitive: bool = True,
+) -> str:
+    """生成上下文提取命令（extract_context 模式）。"""
+    file_glob = build_file_glob(log_dir, file_pattern)
+    quoted_pattern = shlex.quote(keyword)
+    quoted_cache = shlex.quote(cache_path)
+    limit = max(1, int(max_extract_lines))
+    flags = _build_match_flags(
+        fixed_string=fixed_string,
+        case_sensitive=case_sensitive,
+        context_lines=0,
+        with_filename=True,
+        with_line_number=True,
+    )
+
+    before = max(0, int(before))
+    after = max(0, int(after))
+    extract = (
+        f"zgrep{flags} -B{before} -A{after} {quoted_pattern} {file_glob} 2>/dev/null"
+        f" | head -n {limit} > {quoted_cache}"
+    )
     return f"{extract}; wc -l {quoted_cache}"
 
 
@@ -207,6 +344,8 @@ def build_filter_command(
     cache_file: str,
     max_lines: int = 50,
     offset: int = 0,
+    fixed_string: bool = False,
+    case_sensitive: bool = True,
 ) -> str:
     """生成二次过滤命令（filter 模式）。
 
@@ -215,7 +354,13 @@ def build_filter_command(
     """
     quoted_pattern = shlex.quote(keyword)
     quoted_cache = shlex.quote(cache_file)
-    cmd = f"grep -n {quoted_pattern} {quoted_cache}"
+    flags = _build_match_flags(
+        fixed_string=fixed_string,
+        case_sensitive=case_sensitive,
+        with_filename=False,
+        with_line_number=True,
+    )
+    cmd = f"grep{flags} {quoted_pattern} {quoted_cache}"
     cmd += _pagination_suffix(offset, max_lines)
     return cmd
 
@@ -227,6 +372,8 @@ def build_context_command(
     after: int = 50,
     occurrence: int = 1,
     compressed_extensions: list[str] | None = None,
+    fixed_string: bool = False,
+    case_sensitive: bool = True,
 ) -> str:
     """生成上下文获取命令（context 模式）。
 
@@ -247,18 +394,26 @@ def build_context_command(
     quoted_pattern = shlex.quote(keyword)
     quoted_file = shlex.quote(file_path)
     compressed = is_compressed(file_path, compressed_extensions)
+    match_flags = _build_match_flags(
+        fixed_string=fixed_string,
+        case_sensitive=case_sensitive,
+        with_filename=False,
+        with_line_number=True,
+    )
+    # context 模式里 -n 在 flags 里已包含，这里使用 -m1/-B/-A 额外拼接
+    flags_no_line = match_flags.replace(" -n", "", 1)
 
     if occurrence == 1:
         grep_bin = "zgrep" if compressed else "grep"
         return (
-            f"{grep_bin} -m1 -n -B{before} -A{after} "
+            f"{grep_bin} -m1 -n{flags_no_line} -B{before} -A{after} "
             f"{quoted_pattern} {quoted_file}"
         )
 
     # occurrence > 1：两步命令，先取行号再截取范围
     if compressed:
         line_cmd = (
-            f"zcat {quoted_file} | grep -n {quoted_pattern}"
+            f"zcat {quoted_file} | grep{match_flags} {quoted_pattern}"
             f" | sed -n '{occurrence}p' | cut -d: -f1"
         )
         slice_cmd = (
@@ -266,7 +421,7 @@ def build_context_command(
         )
     else:
         line_cmd = (
-            f"grep -n {quoted_pattern} {quoted_file}"
+            f"grep{match_flags} {quoted_pattern} {quoted_file}"
             f" | sed -n '{occurrence}p' | cut -d: -f1"
         )
         slice_cmd = (
@@ -276,7 +431,11 @@ def build_context_command(
     return f"LINE=$({line_cmd}); [ -n \"$LINE\" ] && {slice_cmd}"
 
 
-def parse_extract_result(raw_output: str, cache_path: str) -> dict:
+def parse_extract_result(
+    raw_output: str,
+    cache_path: str,
+    max_extract_lines: int | None = None,
+) -> dict:
     """解析 extract 命令的输出。
 
     extract 命令最后执行 `wc -l <cache>`，输出形如：
@@ -293,24 +452,71 @@ def parse_extract_result(raw_output: str, cache_path: str) -> dict:
             - truncated: 是否触达了 max_extract_lines 上限（由调用方比对）
               此处仅返回 total_lines，调用方根据 max_extract_lines 判断
     """
-    total_lines = 0
-    if raw_output:
-        # 倒序扫描行，找到第一行符合 "<num> <path>" 格式的 wc 输出
-        for line in reversed(raw_output.strip().splitlines()):
-            stripped = line.strip()
-            if not stripped:
-                continue
-            parts = stripped.split(None, 1)
-            if not parts:
-                continue
-            try:
-                total_lines = int(parts[0])
-                break
-            except ValueError:
-                continue
+    total_lines = _parse_wc_total(raw_output)
+    truncated = False
+    if max_extract_lines and max_extract_lines > 0:
+        truncated = total_lines >= int(max_extract_lines)
 
     return {
         "cache_file": cache_path,
         "total_lines": total_lines,
-        "truncated": False,
+        "truncated": truncated,
+    }
+
+
+def parse_estimate_result(
+    raw_output: str,
+    cache_path: str,
+    max_extract_lines: int | None = None,
+) -> dict:
+    """解析 estimate 命令输出。"""
+    total_lines = 0
+    matched_files = 0
+    top_files: list[dict] = []
+
+    in_top = False
+    lines = raw_output.strip().splitlines() if raw_output else []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("__XSH_ESTIMATE_TOTAL__:"):
+            value = stripped.split(":", 1)[1].strip()
+            try:
+                total_lines = int(value)
+            except ValueError:
+                total_lines = 0
+            continue
+        if stripped.startswith("__XSH_ESTIMATE_FILES__:"):
+            value = stripped.split(":", 1)[1].strip()
+            try:
+                matched_files = int(value)
+            except ValueError:
+                matched_files = 0
+            continue
+        if stripped == "__XSH_ESTIMATE_TOP_BEGIN__":
+            in_top = True
+            continue
+        if stripped == "__XSH_ESTIMATE_TOP_END__":
+            in_top = False
+            continue
+
+        if in_top and stripped:
+            parts = stripped.split(None, 1)
+            if len(parts) != 2:
+                continue
+            try:
+                count = int(parts[0])
+            except ValueError:
+                continue
+            top_files.append({"file": parts[1].strip(), "count": count})
+
+    truncated = False
+    if max_extract_lines and max_extract_lines > 0:
+        truncated = total_lines >= int(max_extract_lines)
+
+    return {
+        "cache_file": cache_path,
+        "total_lines": total_lines,
+        "matched_files": matched_files,
+        "top_files": top_files,
+        "truncated": truncated,
     }

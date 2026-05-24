@@ -23,11 +23,14 @@ from .exceptions import (
 from .log_config import get_logger, generate_request_id, set_request_id, set_session_id
 from .log_analyzer import (
     build_search_command,
+    build_estimate_command,
     build_extract_command,
+    build_extract_context_command,
     build_filter_command,
     build_context_command,
     generate_cache_filename,
     parse_extract_result,
+    parse_estimate_result,
 )
 
 logger = get_logger("xshell_mcp")
@@ -39,7 +42,7 @@ logger = get_logger("xshell_mcp")
 mcp = FastMCP("xshell-mcp")
 
 _config = load_config()
-_log_config: LogConfig | None = load_log_config()
+_log_config: LogConfig = load_log_config()
 _bound_session_id: str | None = None
 _bound_client: BridgeClient | None = None
 _session_manager: SessionManager | None = None
@@ -274,12 +277,16 @@ def search_logs(
     occurrence: int = 1,
     cache_file: str = "",
     timeout: int = 60,
+    fixed_string: bool = False,
+    case_sensitive: bool = True,
 ) -> dict:
     """在远程 POD 日志中搜索关键字（支持 .gz 压缩文件）。
 
     四种模式：
     - mode="search":  直接搜索原始日志文件（适合无明确关键字时探索）
+    - mode="estimate": 统计 + 冻结快照（一体化生成缓存，供后续 filter/context 复用）
     - mode="extract": 原子化提取所有匹配行到临时缓存文件（解决日志轮转竞态）
+    - mode="extract_context": 原子化提取匹配 + 上下文到缓存（适合异常堆栈场景）
     - mode="filter":  在缓存文件上二次过滤（如从 traceId 结果中筛 ERROR）
     - mode="context": 获取指定匹配的上下文（查看完整堆栈）
 
@@ -287,7 +294,7 @@ def search_logs(
     - 有明确关键字(traceId等): extract → filter → context
     - 无明确关键字(探索性): search(时间+级别) → 发现线索后 extract
 
-    日志目录和文件格式从项目配置 .xshell-log.json 自动读取。
+    日志目录和文件格式从 MCP 项目配置（config.py + 环境变量）读取。
 
     Args:
         keyword: 搜索关键字（traceId、异常类名、ERROR、日志内容等）
@@ -303,6 +310,8 @@ def search_logs(
         occurrence: [context] 第几次匹配（默认第1次）
         cache_file: [filter/context] 指定缓存文件路径（extract返回的路径）
         timeout: 超时秒数（压缩文件搜索建议60-120）
+        fixed_string: 是否按固定字符串匹配（traceId 场景建议 true）
+        case_sensitive: 是否区分大小写（默认 true）
     """
     rid = generate_request_id()
     set_request_id(rid)
@@ -310,21 +319,12 @@ def search_logs(
     client = get_client()
     marker = "{}{}".format(_config.marker_prefix, int(time.time() * 1000000))
 
-    # 获取日志配置
-    log_dir = ""
-    compressed_ext = [".gz"]
-    max_extract = 10000
-
-    if _log_config:
-        log_dir = _log_config.log_dir
-        compressed_ext = _log_config.compressed_extensions
-        max_extract = _log_config.max_extract_lines
-        if not file_pattern:
-            file_pattern = _log_config.file_pattern
-
-    # 无配置且无 file_pattern 时报错
-    if not log_dir and mode in ("search", "extract"):
-        return {"error": "未找到日志配置(.xshell-log.json)且未指定 file_pattern，无法确定搜索范围"}
+    # 获取日志配置（项目级）
+    log_dir = _log_config.log_dir
+    compressed_ext = _log_config.compressed_extensions
+    max_extract = _log_config.max_extract_lines
+    if not file_pattern:
+        file_pattern = _log_config.file_pattern
 
     logger.info("search_logs mode=%s keyword=%.40s file_pattern=%s", mode, keyword, file_pattern)
 
@@ -340,6 +340,8 @@ def search_logs(
                 max_lines=max_lines,
                 offset=offset,
                 context_lines=context_lines,
+                fixed_string=fixed_string,
+                case_sensitive=case_sensitive,
             )
             resp = client.execute(cmd, marker, timeout=timeout, request_id=rid)
             output = clean_command_output(resp.output, cmd, marker)
@@ -348,12 +350,54 @@ def search_logs(
             elapsed = time.time() - t0
             logger.info("search_logs 完成 mode=search elapsed=%.2fs lines=%d", elapsed, len(lines))
             return {
+                "mode": "search",
                 "output": output,
                 "lines_returned": len(lines),
                 "has_more": len(lines) >= max_lines,
+                "truncated": False,
                 "timed_out": resp.timed_out,
+                "scan_scope": {"log_dir": log_dir, "file_pattern": file_pattern},
+                "next_action_hint": "若已出现 traceId/异常名，可用 estimate 或 extract_context 深入分析",
                 "command": cmd,
             }
+
+        elif mode == "estimate":
+            cache_path = generate_cache_filename()
+            cmd = build_estimate_command(
+                keyword=keyword,
+                log_dir=log_dir,
+                file_pattern=file_pattern,
+                max_extract_lines=max_extract,
+                cache_path=cache_path,
+                fixed_string=fixed_string,
+                case_sensitive=case_sensitive,
+            )
+            resp = client.execute(cmd, marker, timeout=timeout, request_id=rid)
+            output = clean_command_output(resp.output, cmd, marker)
+
+            result = parse_estimate_result(output, cache_path, max_extract_lines=max_extract)
+            result["mode"] = "estimate"
+            result["timed_out"] = resp.timed_out
+            result["has_more"] = result.get("truncated", False)
+            result["lines_returned"] = result.get("total_lines", 0)
+            result["scan_scope"] = {"log_dir": log_dir, "file_pattern": file_pattern}
+            if result.get("total_lines", 0) == 0:
+                hint = "未命中，建议扩大时间范围或改关键字"
+            elif result.get("truncated", False):
+                hint = "命中过多且已触达上限，建议先 filter 缩小再 context"
+            else:
+                hint = "可直接在 cache_file 上执行 filter/context"
+            result["next_action_hint"] = hint
+            result["command"] = cmd
+
+            elapsed = time.time() - t0
+            logger.info(
+                "search_logs 完成 mode=estimate elapsed=%.2fs total_lines=%d cache=%s",
+                elapsed,
+                result.get("total_lines", 0),
+                cache_path,
+            )
+            return result
 
         elif mode == "extract":
             cache_path = generate_cache_filename()
@@ -363,15 +407,52 @@ def search_logs(
                 file_pattern=file_pattern,
                 max_extract_lines=max_extract,
                 cache_path=cache_path,
+                fixed_string=fixed_string,
+                case_sensitive=case_sensitive,
             )
             resp = client.execute(cmd, marker, timeout=timeout, request_id=rid)
             output = clean_command_output(resp.output, cmd, marker)
 
-            result = parse_extract_result(output, cache_path)
+            result = parse_extract_result(output, cache_path, max_extract_lines=max_extract)
+            result["mode"] = "extract"
+            result["has_more"] = result.get("truncated", False)
+            result["lines_returned"] = result.get("total_lines", 0)
+            result["scan_scope"] = {"log_dir": log_dir, "file_pattern": file_pattern}
+            result["next_action_hint"] = "可在 cache_file 上执行 filter/context"
             result["timed_out"] = resp.timed_out
             result["command"] = cmd
             elapsed = time.time() - t0
             logger.info("search_logs 完成 mode=extract elapsed=%.2fs total_lines=%d cache=%s",
+                        elapsed, result.get("total_lines", 0), cache_path)
+            return result
+
+        elif mode == "extract_context":
+            cache_path = generate_cache_filename()
+            cmd = build_extract_context_command(
+                keyword=keyword,
+                log_dir=log_dir,
+                file_pattern=file_pattern,
+                max_extract_lines=max_extract,
+                cache_path=cache_path,
+                before=before,
+                after=after,
+                fixed_string=fixed_string,
+                case_sensitive=case_sensitive,
+            )
+            resp = client.execute(cmd, marker, timeout=timeout, request_id=rid)
+            output = clean_command_output(resp.output, cmd, marker)
+
+            result = parse_extract_result(output, cache_path, max_extract_lines=max_extract)
+            result["mode"] = "extract_context"
+            result["has_more"] = result.get("truncated", False)
+            result["lines_returned"] = result.get("total_lines", 0)
+            result["scan_scope"] = {"log_dir": log_dir, "file_pattern": file_pattern}
+            result["next_action_hint"] = "可直接 filter('ERROR'/'Exception') 后再 context 查看精细片段"
+            result["timed_out"] = resp.timed_out
+            result["command"] = cmd
+
+            elapsed = time.time() - t0
+            logger.info("search_logs 完成 mode=extract_context elapsed=%.2fs total_lines=%d cache=%s",
                         elapsed, result.get("total_lines", 0), cache_path)
             return result
 
@@ -383,6 +464,8 @@ def search_logs(
                 cache_file=cache_file,
                 max_lines=max_lines,
                 offset=offset,
+                fixed_string=fixed_string,
+                case_sensitive=case_sensitive,
             )
             resp = client.execute(cmd, marker, timeout=timeout, request_id=rid)
             output = clean_command_output(resp.output, cmd, marker)
@@ -391,10 +474,14 @@ def search_logs(
             elapsed = time.time() - t0
             logger.info("search_logs 完成 mode=filter elapsed=%.2fs lines=%d", elapsed, len(lines))
             return {
+                "mode": "filter",
                 "output": output,
                 "lines_returned": len(lines),
                 "has_more": len(lines) >= max_lines,
+                "truncated": False,
                 "timed_out": resp.timed_out,
+                "scan_scope": {"cache_file": cache_file},
+                "next_action_hint": "若已锁定目标行，可用 context 查看前后文",
                 "command": cmd,
             }
 
@@ -409,6 +496,8 @@ def search_logs(
                 after=after,
                 occurrence=occurrence,
                 compressed_extensions=compressed_ext,
+                fixed_string=fixed_string,
+                case_sensitive=case_sensitive,
             )
             resp = client.execute(cmd, marker, timeout=timeout, request_id=rid)
             output = clean_command_output(resp.output, cmd, marker)
@@ -416,13 +505,19 @@ def search_logs(
             elapsed = time.time() - t0
             logger.info("search_logs 完成 mode=context elapsed=%.2fs file=%s", elapsed, target_file)
             return {
+                "mode": "context",
                 "output": output,
                 "file": target_file,
+                "lines_returned": len(output.strip().split("\n")) if output.strip() else 0,
+                "has_more": False,
+                "truncated": False,
                 "timed_out": resp.timed_out,
+                "scan_scope": {"file_path": target_file},
+                "next_action_hint": "如仍需更多上下文，可增大 after/before 或更换 occurrence",
                 "command": cmd,
             }
         else:
-            return {"error": f"未知模式: {mode}，支持的模式: search/extract/filter/context"}
+            return {"error": f"未知模式: {mode}，支持的模式: search/estimate/extract/extract_context/filter/context"}
 
     except BridgeTimeoutError:
         logger.warning("search_logs 超时 mode=%s timeout=%ds", mode, timeout)
